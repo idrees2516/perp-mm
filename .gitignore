@@ -1,0 +1,12 @@
+/target
+Cargo.lock
+__pycache__/
+web/node_modules/
+web/.next/
+web/out/
+web/build/
+web/db/
+web/dev.log
+web/server.log
+web/.env
+web/next-env.d.ts

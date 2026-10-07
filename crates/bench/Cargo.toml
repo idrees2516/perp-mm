@@ -1,0 +1,26 @@
+[package]
+name = "bench"
+description = "Latency benchmarks with nanosecond timers (rdtsc on x86_64), Solana-style compute-unit (CU) metering with per-event budgets and graceful degradation, and the full-pipeline event-loop measurement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ob = { path = "../ob" }
+micro = { path = "../micro" }
+models = { path = "../models" }
+perps = { path = "../perps" }
+feed = { path = "../feed" }
+engine = { path = "../engine" }
+tui = { path = "../tui" }
+
+[[example]]
+name = "bench_report"
+path = "examples/bench_report.rs"
+
+[[example]]
+name = "bench_frontend"
+path = "examples/bench_frontend.rs"

@@ -1,0 +1,11 @@
+[package]
+name = "ob"
+description = "glass-style client-side limit order books: 32-way trie ordered set (arXiv:2506.13991), L3 FIFO queues, snapshot/delta application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,12 @@
+[package]
+name = "perps"
+description = "Perpetuals mechanics: BitMEX-style funding (premium+interest with clamps, TWAP rings, exact u128 payments), optimal liquidation under funding (Donnelly-Lin-Lorig arXiv:2601.10812 closed forms + asymptotics + substitution rule), autodeleveraging policies (Chitra arXiv:2512.01112: queue ranking, pro-rata, levered pro-rata, capped water-filling, risk-aware), isolated margin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+micro = { path = "../micro" }

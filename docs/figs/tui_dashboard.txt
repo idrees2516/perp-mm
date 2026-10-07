@@ -1,0 +1,36 @@
+ perp-mm  t=  493.8s   mid   11:DASHBOARD 2:ORDER BOOK 3:GREEKS / VOL SURFACE 4:STRATEGY 5:RISK 6:TAPE 7:HELP
+ [HALTED] [PAUSED] [JUMP] [TOXIC] [OPT]                                         engine p50   600ns p99  1740ns
+
+ micro-price                          101.310 equity
+ spread                                 0.773 300.00                                                   315.51
+ sigma fast                           0.02310 ⠈⢈⢈⢈⢈⢈⢈⢈⢈⢈⠈⢈⢈⢈⢈⢈⢈⡈⡄⡄⡄⠄⡄⡄⡄⡄⡄⡄⠤⠢⠢⠂⡄⡄⡄⠢⠢⠢⠢⠢⠢⠢⠂⠢⠢⠢⠑⠑⠑⠑⠑⠑⠁⠑⠑⠑⠑⠑⠑⠑⠑⠑⠑
+ sigma slow                           0.01920
+ sigma rough                          0.02010 spread
+ hurst                                  0.140 0.40                                                       0.80
+ OFI                                    +18.0 ⠁⠑⠑⠑⠑⠡⠢⠢⡄⡄⠄⢈⢈⢈⢈⢈⢈⢈⢈⢈⡈⠄⡄⠢⠢⠒⠑⠑⠑⠑⠑⠁⠑⠑⠑⠡⠢⠢⡄⡄⢄⢈⠈⢈⢈⢈⢈⢈⢈⢈⡈⡄⠄⠢⠢⠒⠑⠑⠑⠑⠑⠑⠑
+ markout mult                           x1.25
+ imbalance                                    engine latency p50 (ns)
+ █████████████████████│████················   600.00                                                   689.00
+ inventory                                    ⠈⡈⠒⠑⠑⠑⠢⢄⢈⢈⠈⢈⢈⢈⢈⢈⢈⠤⠑⠑⠑⠁⠢⢄⢈⢈⢈⢈⢈⢈⢈⠈⢈⠤⠑⠑⠑⠡⡂⢈⢈⢈⠈⢈⢈⢈⢈⢈⡄⠒⠑⠑⠁⠡⡂⢈⢈⢈⢈⢈⢈⢈⢈
+ █████████████████████│█···················
+ 4 lots                                       latency histogram (0-2us..14-16us)
+                                              ▓▓▓▓▓
+                                              ▓▓▓▓▓
+                                              ▓▓▓▓▓
+                                              ▓▓▓▓▓
+
+
+
+
+
+
+
+
+
+
+
+
+ our live orders:B  202x6    B  201x8    S  204x5    S  205x7
+
+                                                                                      frames 1 render      0ns
+ 1:dash 2:book 3:greeks 4:strategy 5:risk 6:tape 7:help | b/s trade | space pause | k kill | q quit

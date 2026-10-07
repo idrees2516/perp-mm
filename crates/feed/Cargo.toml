@@ -1,0 +1,15 @@
+[package]
+name = "feed"
+description = "Market-data feed layer: compact binary codec (ticks/lots/u128 domain), transport trait (UDP / channel / replay), and a raw-syscall io_uring implementation (no libc crate) following the io_uring-for-DBMSs usage patterns (registered buffers, SQPOLL probing, batched enter)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ob = { path = "../ob" }
+
+[features]
+default = []

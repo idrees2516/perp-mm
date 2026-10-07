@@ -1,0 +1,12 @@
+[package]
+name = "models"
+description = "Quoting models: the unified Avellaneda-Stoikov / Cartea-Jaimungal framework (arXiv:2606.01477) with forced phi=gamma*sigma^2/2 relations, exact HJB v-system solver with policy optimization, GLFT asymptotics, Cont-de-Larrard queue fill probabilities, and BSM/BAW option pricing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+micro = { path = "../micro" }

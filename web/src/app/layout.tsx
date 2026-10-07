@@ -1,0 +1,41 @@
+import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import { Toaster } from "@/components/ui/toaster";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "perp-mm — Options Market-Making Terminal",
+  description:
+    "Live options market-making engine: SSVI arbitrage-free vol surfaces, GLFT vega quotes, vanna-volga overhedge, Whalley-Wilmott hedge bands, HJB policies, markout-adaptive spreads. Rust research engine ported to TypeScript.",
+  keywords: ["market making", "options", "SSVI", "GLFT", "vanna-volga", "Whalley-Wilmott", "HJB", "CLOB", "perp"],
+  icons: {
+    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
+  },
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en" suppressHydrationWarning>
+      <body
+        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
+      >
+        {children}
+        <Toaster />
+      </body>
+    </html>
+  );
+}

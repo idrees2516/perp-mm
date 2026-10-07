@@ -1,0 +1,20 @@
+[package]
+name = "engine"
+description = "The market-making engine: estimator stack (multi-scale vol, jumps, spreads, micro-price, OFI, rough vol), 6 quoting strategies (static / AS / HJB / queue-aware ladder / micro-price / options MM with delta hedging), risk engine (inventory, participation, MMP throttle, kill-switch), simulated venue (MQH-lite book dynamics, adverse-selection fills, fees, funding, margin/ADL), venue adapters (sim + perp-options-clob command/event semantics), PnL attribution and CSV metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ob = { path = "../ob" }
+micro = { path = "../micro" }
+models = { path = "../models" }
+perps = { path = "../perps" }
+vol = { path = "../vol" }
+feed = { path = "../feed" }
+
+[dev-dependencies]
+tui = { path = "../tui" }

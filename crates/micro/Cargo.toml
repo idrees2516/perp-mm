@@ -1,0 +1,11 @@
+[package]
+name = "micro"
+description = "Market-microstructure analytics kernel: jump tests (Lee-Mykland 2008, BNS-style ratio, Bibinger-Hautsch-Ristig block-minima), spread estimators (Roll, serial-dependence Roll, Corwin-Schultz, Brouty-Garcin-Roccaro variance-ratio family), micro-price, order-flow imbalance, rough volatility (RFSV), Composite Liquidity Factor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
