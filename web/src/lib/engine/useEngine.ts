@@ -25,7 +25,7 @@ export interface EngineControls {
   strategies: typeof STRATEGIES;
 }
 
-export function useEngine(seed = 12345): EngineControls {
+export function useEngine(seed?: number): EngineControls {
   const mmRef = useRef<MarketMaker | null>(null);
   const [snap, setSnap] = useState<EngineSnapshot | null>(null);
   const [running, setRunning] = useState(true);
@@ -71,7 +71,7 @@ export function useEngine(seed = 12345): EngineControls {
   }, []);
 
   useEffect(() => {
-    if (!mmRef.current) mmRef.current = new MarketMaker(seed);
+    if (!mmRef.current) mmRef.current = new MarketMaker(seed ?? Math.floor(Math.random() * 1e9));
     const mm = mmRef.current;
     let raf = 0;
     let last = performance.now();

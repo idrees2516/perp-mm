@@ -192,6 +192,8 @@ export class MarketMaker {
 
   halted = false;
   haltReason = "";
+  /** Sim-clock timestamp of the halt (for the auto risk-on cooldown). */
+  private haltedAt = -1;
   peakEquity = 0;
   positionLimit = 60;
   vegaLimit = defaultOptionConfig.vegaLimit;
@@ -243,11 +245,19 @@ export class MarketMaker {
     const t0 = performance.now();
     this.cu = 0;
     if (this.halted) {
-      this.venue.step(dt, this.estSigma(), { bid: [], ask: [] }, this.steps);
-      this.clock += dt;
-      this.steps++;
-      this.recordPerf(t0);
-      return;
+      // auto risk-on: after a 30-s cooldown the desk re-enables quoting
+      // with a re-anchored peak (risk-off / risk-on cycling)
+      if (this.clock - this.haltedAt > 30) {
+        this.halted = false;
+        this.haltReason = "";
+        this.peakEquity = this.totalEquity();
+      } else {
+        this.venue.step(dt, this.estSigma(), { bid: [], ask: [] }, this.steps);
+        this.clock += dt;
+        this.steps++;
+        this.recordPerf(t0);
+        return;
+      }
     }
     const mid0 = this.venue.mid;
     const sigma = this.estSigma();
@@ -451,18 +461,31 @@ export class MarketMaker {
   }
 
   private riskCheck() {
+    if (this.halted) {
+      // auto risk-on: after a 30-s cooldown the desk re-enables quoting
+      // with a re-anchored peak (risk-off / risk-on cycling)
+      if (this.clock - this.haltedAt > 30) {
+        this.halted = false;
+        this.haltReason = "";
+        this.peakEquity = this.totalEquity();
+      }
+      return;
+    }
     const eq = this.totalEquity();
-    // relative drawdown kill-switch (15% of peak, floor 180 units — the
+    // relative drawdown kill-switch (20% of peak, floor 180 units — the
     // option book's gamma MTM swings are an order above the perp drift)
-    const ddLimit = Math.max(180, this.peakEquity * 0.15);
+    const ddLimit = Math.max(180, this.peakEquity * 0.2);
     if (this.peakEquity - eq > ddLimit) {
       this.halted = true;
+      this.haltedAt = this.clock;
       this.haltReason = `drawdown kill-switch (${(this.peakEquity - eq).toFixed(1)} > ${ddLimit.toFixed(1)})`;
     } else if (Math.abs(this.venue.position) > this.positionLimit) {
       this.halted = true;
+      this.haltedAt = this.clock;
       this.haltReason = "perp position limit breach";
     } else if (Math.abs(this.optNet.vega) > this.vegaLimit) {
       this.halted = true;
+      this.haltedAt = this.clock;
       this.haltReason = "vega limit breach";
     }
   }
@@ -475,6 +498,7 @@ export class MarketMaker {
   resume() {
     this.halted = false;
     this.haltReason = "";
+    this.haltedAt = -1;
     this.peakEquity = this.totalEquity();
   }
 

@@ -130,7 +130,7 @@ export default function Home() {
             <StatChip label="opt fills" value={`${o.fills}`} sub={`hedges ${o.hedgeLotsTotal}`} />
             <StatChip label="markout ×" value={fmt(snap.markouts.multiplier)} tone={snap.markouts.multiplier > 1.3 ? "warn" : "neutral"} sub={`tox ${(snap.markouts.toxicity * 100).toFixed(0)}%`} />
             <StatChip label="CU" value={`${snap.perf.cuPct.toFixed(0)}%`} tone={snap.perf.cuPct > 80 ? "warn" : "accent"} sub={`${snap.perf.cu}/${snap.perf.cuBudget}`} />
-            <StatChip label="tick p50" value={`${(snap.perf.p50 / 1000).toFixed(0)}µs`} sub={`p99 ${(snap.perf.p99 / 1000).toFixed(0)}µs`} />
+            <StatChip label="tick p50" value={snap.perf.p50 > 0 ? `${(snap.perf.p50 / 1000).toFixed(0)}µs` : "<1µs"} sub={`p99 ${(snap.perf.p99 / 1000).toFixed(0)}µs`} />
             <StatChip label="sim clock" value={`${Math.floor(snap.clock / 60)}m ${Math.floor(snap.clock % 60)}s`} sub={`${snap.steps} steps`} />
           </div>
           <div className="ml-auto flex items-center gap-2">
@@ -661,7 +661,7 @@ export default function Home() {
       <footer className="mt-3 border-t border-neutral-800 bg-neutral-950 px-3 py-2">
         <div className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-2 font-mono text-[9px] text-neutral-600">
           <span>perp-mm · 9-crate Rust workspace + TS engine port · SSVI/GLFT/HJB/WW/vanna–volga · 8 strategies · {snap.steps} steps · {snap.perf.ops} fills</span>
-          <span>tick p50 {(snap.perf.p50 / 1000).toFixed(0)}µs · p99 {(snap.perf.p99 / 1000).toFixed(0)}µs · CU {snap.perf.cu}/{snap.perf.cuBudget} ({snap.perf.cuPct.toFixed(1)}%)</span>
+          <span>tick p50 {snap.perf.p50 > 0 ? `${(snap.perf.p50 / 1000).toFixed(0)}µs` : "<1µs"} · p99 {(snap.perf.p99 / 1000).toFixed(0)}µs · CU {snap.perf.cu}/{snap.perf.cuBudget} ({snap.perf.cuPct.toFixed(1)}%)</span>
         </div>
       </footer>
     </div>
