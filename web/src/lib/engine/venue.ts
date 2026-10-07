@@ -67,16 +67,13 @@ export class MarkoutTracker {
     return clamp01(-this.ewmaRatio);
   }
   get multiplier(): number {
-    return Math.min(1 + this.theta * this.toxicity(), this.maxMult);
-  }
-  private toxicity(): number {
-    return clamp01(-this.ewmaRatio);
+    return Math.min(1 + this.theta * this.toxicity, this.maxMult);
   }
   get resolvedCount(): number {
     return this.resolved.length;
   }
   state(): MarkoutTrackerState {
-    return { ratio: this.ewmaRatio, toxicity: this.toxicity(), multiplier: this.multiplier, resolved: this.resolved.length };
+    return { ratio: this.ewmaRatio, toxicity: this.toxicity, multiplier: this.multiplier, resolved: this.resolved.length };
   }
 }
 
@@ -109,6 +106,12 @@ export interface PerpConfig {
   informedImpact: number;
   /** Initial price. */
   s0: number;
+  /** Funding interval (seconds) — BitMEX/Derive 8h shape. */
+  fundingInterval: number;
+  /** Funding clamp (± fraction per interval, exchange cap). */
+  fundingClamp: number;
+  /** Interest component of funding (per interval). */
+  fundingInterest: number;
 }
 
 export const defaultPerpConfig: PerpConfig = {
@@ -121,6 +124,9 @@ export const defaultPerpConfig: PerpConfig = {
   informedRate: 0.012,
   informedImpact: 6,
   s0: 100,
+  fundingInterval: 8 * 3600,
+  fundingClamp: 0.0075,
+  fundingInterest: 0.0001,
 };
 
 export interface BookTop {
@@ -147,17 +153,32 @@ export class PerpVenue {
   feesPaid = 0;
   hedgeFees = 0;
   spreadCapture = 0;
+  /** Index price — the funding anchor (spot-like latent). */
+  index: number;
+  /** EWMA premium index: (perp mid − index)/index. */
+  premiumIndex = 0;
+  /** Current funding rate (signed fraction per interval). */
+  fundingRate = 0;
+  /** Cumulative funding paid by the desk (longs pay positive rate). */
+  fundingPaid = 0;
+  fundingElapsed = 0;
   private markSum = 0;
   private prevMark = 0;
   private drift = 0;
   private sigmaState = 0.00035; // per sqrt-second price vol (~0.55%/√s? scaled below)
   readonly markouts = new MarkoutTracker(5, 1.5);
+  /** Per-side markout trackers (Albers et al. 2025: fill likelihood and
+   *  post-fill returns are negatively correlated — the response must be
+   *  directional, widening the toxic side only, not both). */
+  readonly markoutsBid = new MarkoutTracker(5, 1.5);
+  readonly markoutsAsk = new MarkoutTracker(5, 1.5);
   tape: Array<{ t: number; price: number; lots: number; side: "bid" | "ask"; ours: boolean }> = [];
   midHistory: number[] = [];
   equityHistory: number[] = [];
 
   constructor(public cfg: PerpConfig, private rng: Rng) {
     this.fair = cfg.s0;
+    this.index = cfg.s0;
     // initial top consistent with the step-0 rebuild structure (half-spread
     // = tick/2) so the estimator is not poisoned by a one-off structural jump
     this.top = { bid: cfg.s0 - cfg.tickSize / 2, ask: cfg.s0 + cfg.tickSize / 2, bidSz: 40, askSz: 40 };
@@ -185,8 +206,9 @@ export class PerpVenue {
   ): Fill[] {
     const cfg = this.cfg;
     // --- latent price: OU drift + diffusion + vol regime ---
-    // gentle mean reversion to s0 keeps the sim in a sane regime
-    this.drift = 0.99 * this.drift - 0.05 * this.drift * dt + 0.0008 * Math.log(this.cfg.s0 / this.fair);
+    // gentle mean reversion toward the INDEX (the funding pin — the perp
+    // is pulled back to its funding anchor, not to a fixed level)
+    this.drift = 0.99 * this.drift - 0.05 * this.drift * dt + 0.004 * Math.log(this.index / this.fair);
     this.sigmaState = clampNum(this.sigmaState * Math.exp(volOfVol * Math.sqrt(dt) * 0.02 * this.rng.normal()), 1e-5, 0.004);
     const effSigma = sigma;
     let jump = 0;
@@ -197,7 +219,11 @@ export class PerpVenue {
       // relative log-move of informedImpact ticks (e.g. 6 ticks ≈ 3% at 100)
       jump = (informedDir * cfg.informedImpact * cfg.tickSize * (0.5 + this.rng.uniform())) / this.fair;
     }
-    this.fair = Math.max(1, this.fair * Math.exp(this.drift * dt + effSigma * Math.sqrt(dt) * this.rng.normal() + jump));
+    const z = this.rng.normal();
+    this.fair = Math.max(1, this.fair * Math.exp(this.drift * dt + effSigma * Math.sqrt(dt) * z + jump));
+    // index shares the diffusion innovation (correlated perp/index), with
+    // no perp-specific drift or informed jump — the basis is purely perp-side
+    this.index = Math.max(1, this.index * Math.exp(effSigma * Math.sqrt(dt) * z * 0.995));
     // --- displayed book rebuilds around the fair ---
     const halfSpr = Math.max(cfg.tickSize, effSigma * Math.sqrt(dt) * 2.2 * 100) / 2;
     // quote-flicker noise kept well below the per-step diffusion so the
@@ -235,9 +261,30 @@ export class PerpVenue {
         }
       }
     }
+    // --- funding: premium index EWMA + BitMEX-shape rate, paid per interval ---
+    const basis = (this.mid - this.index) / this.index;
+    this.premiumIndex = 0.94 * this.premiumIndex + 0.06 * basis;
+    this.fundingElapsed += dt;
+    if (this.fundingElapsed >= cfg.fundingInterval) {
+      this.fundingElapsed -= cfg.fundingInterval;
+      // BitMEX/Derive shape: funding = premium + clamp(interest − premium,
+      // ±0.05%), clamped to the exchange cap — positive ⇒ longs pay shorts
+      const i = cfg.fundingInterest;
+      this.fundingRate = clampNum(
+        this.premiumIndex + clampNum(i - this.premiumIndex, -0.0005, 0.0005),
+        -cfg.fundingClamp,
+        cfg.fundingClamp,
+      );
+      // payment: longs pay positive funding (position × rate × index)
+      const pay = this.position * this.fundingRate * this.index * cfg.lotSize;
+      this.cash -= pay;
+      this.fundingPaid += pay;
+    }
     // --- accounting ---
     const midNow = this.mid;
     this.markouts.onStep(stepIndex, midNow);
+    this.markoutsBid.onStep(stepIndex, midNow);
+    this.markoutsAsk.onStep(stepIndex, midNow);
     this.midHistory.push(midNow);
     if (this.midHistory.length > 720) this.midHistory.shift();
     // equity mark decomposition
@@ -258,7 +305,10 @@ export class PerpVenue {
     this.feesPaid += fee;
     this.cash -= fee;
     this.spreadCapture += (this.mid - price) * signed * lots;
-    this.markouts.onFill(stepIndex, signed, price, Math.max(this.spread / 2, this.cfg.tickSize / 2));
+    const hs = Math.max(this.spread / 2, this.cfg.tickSize / 2);
+    this.markouts.onFill(stepIndex, signed, price, hs);
+    if (side === "bid") this.markoutsBid.onFill(stepIndex, signed, price, hs);
+    else this.markoutsAsk.onFill(stepIndex, signed, price, hs);
     const f: Fill = { side, price, lots, fee, toxic };
     this.tape.push({ t: Date.now(), price, lots, side, ours: true });
     if (this.tape.length > 120) this.tape.shift();

@@ -21,6 +21,9 @@ export interface EngineControls {
   setStrategy: (id: StrategyId) => void;
   setParam: <K extends keyof EngineParams>(k: K, v: EngineParams[K]) => void;
   setSelectedExp: (i: number) => void;
+  requestRfq: (templateId: string, lots: number) => number | null;
+  executeRfq: (id: number, side: "desk-buys" | "desk-sells") => { ok: boolean; reason?: string };
+  cancelRfq: (id: number) => void;
   strategyName: string;
   strategies: typeof STRATEGIES;
 }
@@ -69,6 +72,18 @@ export function useEngine(seed?: number): EngineControls {
     const mm = mmRef.current;
     if (mm) mm.selectedExp = i;
   }, []);
+  const requestRfq = useCallback((templateId: string, lots: number) => {
+    const mm = mmRef.current;
+    return mm ? mm.requestRfq(templateId, lots) : null;
+  }, []);
+  const executeRfq = useCallback((id: number, side: "desk-buys" | "desk-sells") => {
+    const mm = mmRef.current;
+    return mm ? mm.executeRfq(id, side) : { ok: false, reason: "engine not ready" };
+  }, []);
+  const cancelRfq = useCallback((id: number) => {
+    const mm = mmRef.current;
+    if (mm) mm.cancelRfq(id);
+  }, []);
 
   useEffect(() => {
     if (!mmRef.current) mmRef.current = new MarketMaker(seed ?? Math.floor(Math.random() * 1e9));
@@ -102,5 +117,5 @@ export function useEngine(seed?: number): EngineControls {
 
   const strategyName = STRATEGIES.find((s) => s.id === (snap?.strategy ?? "volsurf"))?.name ?? "Vol-Surface MM";
 
-  return { snap, running, speed, setSpeed, play, pause, reset, resume, setStrategy, setParam, setSelectedExp, strategyName, strategies: STRATEGIES };
+  return { snap, running, speed, setSpeed, play, pause, reset, resume, setStrategy, setParam, setSelectedExp, requestRfq, executeRfq, cancelRfq, strategyName, strategies: STRATEGIES };
 }

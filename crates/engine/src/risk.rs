@@ -29,6 +29,11 @@ pub struct RiskEngine {
     pub vol_halt_mult: f64,
     /// Daily loss kill-switch (quote units).
     pub loss_limit: f64,
+    /// SFPM portfolio-margin utilization (set by the engine each cycle).
+    /// Hard breach (>= 0.9) gates the risk-ADDING side; the unwind side
+    /// always stays live — a margin breach must never freeze the desk
+    /// (the exposure could then never be worked off).
+    pub margin_util: f64,
     // state
     step: usize,
     last_requote_step: usize,
@@ -59,6 +64,7 @@ impl RiskEngine {
             halted: None,
             rolling_fills_abs: 0.0,
             rolling_net_delta: 0.0,
+            margin_util: 0.0,
         }
     }
 
@@ -102,7 +108,11 @@ impl RiskEngine {
         {
             return RiskAction::Halt("vol spike");
         }
-        // inventory bounds: stop quoting the side that increases exposure
+        // inventory bounds: stop quoting the side that increases exposure.
+        // NOTE: when the option leg is enabled the engine passes the
+        // UNHEDGED combined delta here (hedge leg + option book) — a
+        // delta-hedged book is the point of the desk, not a breach; the
+        // raw hedge-leg size must never trip this gate.
         let mut q = desired;
         if inventory >= self.max_inventory {
             q.bid = None;
@@ -111,6 +121,17 @@ impl RiskEngine {
         if inventory <= -self.max_inventory {
             q.ask = None;
             q.ask_levels.clear();
+        }
+        // SFPM margin-utilization gate: hard breach blocks the risk-adding
+        // side only (directional, self-recovering — never a full freeze)
+        if self.margin_util >= 0.9 {
+            if inventory > 0 {
+                q.bid = None;
+                q.bid_levels.clear();
+            } else if inventory < 0 {
+                q.ask = None;
+                q.ask_levels.clear();
+            }
         }
         // size clamps (level 0 + per-side totals across the ladder)
         if let Some((p, s)) = q.bid {

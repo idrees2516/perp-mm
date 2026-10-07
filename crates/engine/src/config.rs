@@ -70,6 +70,9 @@ pub struct EngineConfig {
     pub funding_rate: f64,
     /// Inventory bound (lots).
     pub max_inventory: i64,
+    /// Desk capital base (quote units) for margin-utilization accounting —
+    /// SFPM utilization is initial margin / (capital + realized PnL).
+    pub desk_capital: f64,
     /// Risk aversion gamma (the unified framework's single scalar).
     pub gamma: f64,
     /// HJB solver time steps.
@@ -105,6 +108,7 @@ impl Default for EngineConfig {
             funding_interval: 8.0 * 3600.0,
             funding_rate: 0.0001,
             max_inventory: 20,
+            desk_capital: 1000.0,
             gamma: 0.1,
             hjb_steps: 300,
             levels: 3,

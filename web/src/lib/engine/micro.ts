@@ -165,3 +165,101 @@ export class HurstEstimator {
     return clamp((n * sxy - sx * sy) / den / 2, 0.05, 0.95);
   }
 }
+
+// ----------------------------------------------------------------------
+
+/**
+ * Online Cox-intensity learner for the fill model λ(δ) = A·e^{−κ·x},
+ * x = distance in ticks: the desk's quote distances are optimal only
+ * under the TRUE (A, κ), and real desks estimate them from realized
+ * fills rather than assuming them. Method-of-moments for A
+ * (E[N] = A·E[exposure] is exact for Cox processes), score climbing
+ * on the exponential-tilting parameter for κ, exponential forgetting,
+ * and count-based shrinkage toward the prior (a James–Stein-flavoured
+ * guard against estimator noise steering the quotes).
+ */
+export class IntensityLearner {
+  private decay: number;
+  private nFills = 0;
+  private exposure = 0;
+  private fillDistSum = 0;
+  private tiltMoment = 0;
+  /** Posterior-free running estimate (raw). */
+  kappaRaw: number;
+  aRaw: number;
+
+  constructor(
+    public priorA: number,
+    public priorKappa: number,
+    halfLifeSteps = 900,
+    /** Shrinkage pseudo-count of the prior. */
+    public priorWeight = 400,
+  ) {
+    this.decay = Math.pow(0.5, 1 / Math.max(1, halfLifeSteps));
+    this.kappaRaw = priorKappa;
+    this.aRaw = priorA;
+  }
+
+  /** Record the exposure integral of the resting ladder at the current κ̂
+   *  (also advances the κ score-climb once per call). */
+  observeExposure(levels: Array<{ distTicks: number; active: boolean }>, dt: number) {
+    const d = Math.pow(this.decay, dt);
+    this.nFills *= d;
+    this.exposure *= d;
+    this.fillDistSum *= d;
+    this.tiltMoment *= d;
+    let e = 0;
+    let m = 0;
+    for (const l of levels) {
+      if (!l.active) continue;
+      const w = Math.exp(-this.kappaRaw * Math.max(0, l.distTicks));
+      e += w;
+      m += w * Math.max(0, l.distTicks);
+    }
+    this.exposure += e * dt;
+    // E[∫δ·λ dt] at the running estimate = A·∫δ·e^{−κδ}dt
+    this.tiltMoment += this.aRaw * m * dt;
+    this.climb();
+  }
+
+  /** Record a fill at the given distance (ticks). */
+  observeFill(distTicks: number) {
+    this.nFills += 1;
+    this.fillDistSum += Math.max(0, distTicks);
+  }
+
+  /** One gradient step on the Cox log-likelihood: ∂ℓ/∂κ ∝ −Σd_fills +
+   *  E[Σ d·λ] — fills closer than the exposure-weighted mean distance
+   *  push κ up (sharper decay), fills farther push it down. */
+  private climb() {
+    if (this.exposure > 1e-9) {
+      this.aRaw = this.nFills / this.exposure;
+    }
+    if (this.nFills > 5) {
+      const g = (-this.fillDistSum + this.tiltMoment) / Math.max(this.nFills, 1);
+      this.kappaRaw = clamp(this.kappaRaw * Math.exp(0.02 * g), 0.15, 2.5);
+    }
+  }
+
+  /** Shrunk κ for quoting: w = n/(n + priorWeight). */
+  kappaUsed(): number {
+    const w = this.nFills / (this.nFills + this.priorWeight);
+    return w * this.kappaRaw + (1 - w) * this.priorKappa;
+  }
+
+  aUsed(): number {
+    const w = this.nFills / (this.nFills + this.priorWeight);
+    return clamp(w * this.aRaw + (1 - w) * this.priorA, 1e-4, 5);
+  }
+
+  state(): { fills: number; aRaw: number; kappaRaw: number; aUsed: number; kappaUsed: number; exposure: number } {
+    return {
+      fills: this.nFills,
+      aRaw: this.aRaw,
+      kappaRaw: this.kappaRaw,
+      aUsed: this.aUsed(),
+      kappaUsed: this.kappaUsed(),
+      exposure: this.exposure,
+    };
+  }
+}

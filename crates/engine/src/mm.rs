@@ -12,7 +12,9 @@ use crate::config::EngineConfig;
 use crate::estimator::{EstimatorStack, MarketState};
 use crate::markout::MarkoutTracker;
 use crate::metrics::RunMetrics;
+use crate::margin::{portfolio_margin, MarginLeg, MarginState};
 use crate::options_market::{HedgeMode, OptionMarket};
+use crate::rfq::{RfqEngine, RfqRiskCtx};
 use crate::risk::{RiskAction, RiskEngine};
 use crate::strategy::{build, QuoteCtx, QuotingStrategy, Quotes, StrategyKind};
 use crate::venue::{SimVenue, VenueEvent};
@@ -52,6 +54,11 @@ pub struct MarketMaker {
     n_steps: usize,
     /// Last option view (for the gateway snapshot).
     pub last_opt_view: Option<crate::options_market::OptionsView>,
+    /// Institutional RFQ lane (Paradigm / Derive V3 protocol shape).
+    pub rfq: RfqEngine,
+    /// Cached SFPM portfolio-margin state.
+    pub margin: MarginState,
+    margin_age: usize,
 }
 
 impl MarketMaker {
@@ -87,6 +94,9 @@ impl MarketMaker {
             step: 0,
             n_steps,
             last_opt_view: None,
+            rfq: RfqEngine::new(),
+            margin: MarginState { scanning_loss: 0.0, somc: 0.0, maintenance: 0.0, initial: 0.0, utilization: 0.0, worst: 0 },
+            margin_age: 0,
         }
     }
 
@@ -161,6 +171,47 @@ impl MarketMaker {
                 self.venue.take(side, lots);
             }
             self.last_opt_view = Some(view);
+
+            // --- RFQ lane: institutional packages, firm TTL, atomic fills ---
+            let ctx = RfqRiskCtx {
+                unhedged_lots: unhedged,
+                net_delta_limit: self.risk.max_inventory as f64,
+                net_vega: view.net_vega,
+                vega_limit: opt.cfg.max_position_lots * 100.0,
+                freeze: self.margin.utilization >= 0.9,
+                lot_size: self.cfg.option_market.perp_lot_size,
+                multiplier: 1.0,
+            };
+            let executed = self.rfq.step(self.cfg.dt, mid_now, opt, rng, &ctx);
+            if !executed.is_empty() {
+                self.margin_age = 999; // force a margin refresh next cycle
+            }
+
+            // --- SFPM portfolio margin (scan amortized over 20 steps) ---
+            if self.margin_age >= 20 {
+                self.margin_age = 0;
+                let legs: Vec<MarginLeg> = opt
+                    .cfg
+                    .moneyness
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| opt.pos[*i].abs() > 1e-9)
+                    .map(|(i, m)| {
+                        let iv = opt.surface().iv(m.ln(), opt.cfg.t_eff);
+                        MarginLeg { kind: opt.cfg.kind, strike: m * mid_now, iv, t: opt.cfg.t_eff, lots: opt.pos[i] }
+                    })
+                    .collect();
+                self.margin = portfolio_margin(
+                    mid_now,
+                    &legs,
+                    self.venue.inventory as f64,
+                    self.cfg.lot_size,
+                    self.equity() + self.cfg.desk_capital,
+                    1.0,
+                );
+            }
+            self.margin_age += 1;
+            self.risk.margin_util = self.margin.utilization;
         }
         // 6) requote cadence
         self.risk.tick();
@@ -209,7 +260,16 @@ impl MarketMaker {
         } else {
             self.strategy.quotes(&ctx)
         };
-        let action = self.risk.filter(desired, state, self.venue.inventory);
+        // risk-v2 metric: with the option leg live the limit binds on the
+        // UNHEDGED combined delta (hedge leg + option book) — never on the
+        // raw hedge-leg size (that false-positive freeze was the bug class
+        // fixed in the web engine; the Rust filter was already directional,
+        // this aligns the METRIC)
+        let inv_metric = match self.last_opt_view {
+            Some(v) => (v.net_delta_lots + self.venue.inventory as f64).round() as i64,
+            None => self.venue.inventory,
+        };
+        let action = self.risk.filter(desired, state, inv_metric);
         match action {
             RiskAction::Halt(_) => {
                 self.cancel_strategy_orders();
@@ -521,7 +581,10 @@ mod tests {
         enable_options(&mut cfg, QuoterMode::Glft, HedgeMode::WwBand);
         let mut mm = MarketMaker::new(cfg, StrategyKind::VolSurface, 21);
         let mut rng = Rng::new(21);
-        for _ in 0..400 {
+        // NOTE: the institutional RFQ lane also draws from the engine RNG,
+        // so the seeded trajectory shifts when it is active — the run is
+        // long enough that the WW band is crossed with near-certainty
+        for _ in 0..1200 {
             mm.step(&mut rng);
         }
         let view = mm.last_opt_view.expect("option view");
@@ -533,6 +596,14 @@ mod tests {
             "no hedge executed (delta {})",
             view.net_delta_lots
         );
+        // the RFQ lane is live: requests arrived and were risk-priced
+        assert!(
+            mm.rfq.stats.requests > 0,
+            "rfq lane silent: {} requests",
+            mm.rfq.stats.requests
+        );
+        // SFPM margin state is being maintained
+        assert!(mm.margin.initial >= 0.0 && mm.margin.utilization >= 0.0);
         // combined equity is finite
         assert!(mm.equity().is_finite());
     }

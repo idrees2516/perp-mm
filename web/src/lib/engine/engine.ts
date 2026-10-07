@@ -16,9 +16,11 @@ import { SsviSurface } from "./ssvi";
 import { fullGreeks, FullGreeks } from "./bsm";
 import { MmHjb, defaultProblem, asQuotes, asHalfSpread, asReservation, AsParams, OptMm, HedgeCadence } from "./models";
 import { VannaVolga } from "./vannaVolga";
-import { Ewma, RollSpread, microPrice, OfiTracker, JumpDetector, HurstEstimator } from "./micro";
+import { Ewma, RollSpread, microPrice, OfiTracker, JumpDetector, HurstEstimator, IntensityLearner } from "./micro";
 import { PerpVenue, defaultPerpConfig, PerpQuoteLevel } from "./venue";
-import { OptionMarket, defaultOptionConfig, OptionFill } from "./options";
+import { OptionMarket, defaultOptionConfig, OptionFill, RiskGate } from "./options";
+import { RfqEngine, RfqRiskCtx, RfqQuoteView, RfqExecEvent, RFQ_TEMPLATES } from "./rfq";
+import { portfolioMargin, MarginState } from "./margin";
 
 export type StrategyId = "static" | "as" | "hjb" | "queue" | "micro" | "optmm" | "ladder" | "volsurf";
 
@@ -82,7 +84,7 @@ const OPT_GAMMA_SCALE = 4.3;
 /** Per-$-wealth risk aversion for the WW band. */
 const WW_GAMMA_SCALE = 2e-5;
 /** Desk starting capital (quote units) — PnL is measured against it. */
-export const INITIAL_CAPITAL = 1000;
+export const INITIAL_CAPITAL = 2500;
 
 export interface ChainRow {
   moneyness: number;
@@ -130,20 +132,52 @@ export interface EngineSnapshot {
     inventory: number;
     fees: number;
     hedgeCost: number;
+    funding: number;
     optionPremium: number;
     optionMark: number;
     total: number;
   };
   quotes: { bid: PerpQuoteLevel[]; ask: PerpQuoteLevel[] };
   strategy: StrategyId;
-  markouts: { ratio: number; toxicity: number; multiplier: number; resolved: number };
+  markouts: { ratio: number; toxicity: number; multiplier: number; resolved: number; multBid: number; multAsk: number };
+  funding: {
+    rate: number;
+    premiumIndex: number;
+    nextIn: number;
+    interval: number;
+    paid: number;
+    index: number;
+    carrySkew: number;
+  };
+  learned: { aRaw: number; kappaRaw: number; aUsed: number; kappaUsed: number; fills: number; exposure: number };
+  rfq: {
+    active: RfqQuoteView[];
+    recent: RfqQuoteView[];
+    executions: RfqExecEvent[];
+    requests: number;
+    executed: number;
+    refused: number;
+    premiumFlow: number;
+  };
+  margin: MarginState;
   risk: {
-    positionLimit: number;
+    netDeltaLimit: number;
+    grossHedgeCap: number;
     vegaLimit: number;
     vegaUsed: number;
+    /** Unhedged combined delta (hedge leg + option book), lots. */
+    netDelta: number;
+    /** Gross hedge-leg size, lots. */
+    grossHedge: number;
     drawdown: number;
+    /** nominal | gated (soft band) | breach (hard limit) | halted (kill-switch). */
+    state: "nominal" | "gated" | "breach" | "halted";
+    gatedOn: string;
+    /** Option book is being wound down (gross hedge cap breach). */
+    windDown: boolean;
     halted: boolean;
     haltReason: string;
+    events: Array<{ t: number; msg: string }>;
   };
   options: {
     expiries: number[];
@@ -190,18 +224,37 @@ export class MarketMaker {
   hedgeLotsTotal = 0;
   lastHedgeAction = 0;
 
+  /** Kill-switch halt (drawdown only): quotes off, hedge + marks stay live. */
   halted = false;
   haltReason = "";
   /** Sim-clock timestamp of the halt (for the auto risk-on cooldown). */
   private haltedAt = -1;
   peakEquity = 0;
-  positionLimit = 60;
+  /** Risk v2: the position limit binds on the UNHEDGED combined delta —
+   *  a delta-hedged options book is the point of the desk, not a breach. */
+  netDeltaLimit = 60;
+  /** Sanity cap on the gross hedge leg (lots) — wind-down territory. */
+  grossHedgeCap = 240;
   vegaLimit = defaultOptionConfig.vegaLimit;
+  /** Directional gating state — self-recovering, never a full freeze. */
+  riskState: "nominal" | "gated" | "breach" = "nominal";
+  gatedOn = "";
+  private lastRiskState: "nominal" | "gated" | "breach" = "nominal";
+  riskEventTape: Array<{ t: number; msg: string }> = [];
 
   private latencies: number[] = [];
   private cu = 0;
   private cuBudget = 600;
   private ops = 0;
+  /** Online Cox-intensity learner for the perp fill model. */
+  learner = new IntensityLearner(defaultPerpConfig.aIntensity, defaultPerpConfig.kappaIntensity);
+  /** Institutional RFQ lane (Paradigm / Derive V3 protocol shape). */
+  rfqEngine: RfqEngine;
+  /** Cached portfolio-margin state (recomputed every N steps). */
+  marginState: MarginState;
+  private marginAge = 999;
+  /** Per-expiry net vega (term-structure buckets for per-pillar quotes). */
+  vegaPerExp: number[] = [];
 
   clock = 0;
   steps = 0;
@@ -221,6 +274,8 @@ export class MarketMaker {
     this.hedgeBand = new HedgeCadence(0.3, this.params.gamma * WW_GAMMA_SCALE, 100);
     this.prevMid = this.venue.mid;
     this.peakEquity = INITIAL_CAPITAL;
+    this.rfqEngine = new RfqEngine(this.rng, 5, 1 / 40);
+    this.marginState = portfolioMargin(this.venue.mid, [], 0, defaultPerpConfig.lotSize, INITIAL_CAPITAL, defaultOptionConfig.multiplier);
   }
 
   optMm(): OptMm {
@@ -251,10 +306,27 @@ export class MarketMaker {
         this.halted = false;
         this.haltReason = "";
         this.peakEquity = this.totalEquity();
+        this.logRiskEvent("risk-on after cooldown (peak re-anchored)");
       } else {
+        // Risk-off: quoting is suppressed everywhere, but risk-REDUCING
+        // paths stay live — the venue keeps marking, the surface keeps
+        // evolving and the delta hedge keeps running. A kill-switch that
+        // froze the hedge would trap the very risk it is meant to shed.
+        // Firm RFQ quotes are pulled immediately (Derive MMP /
+        // cancel-on-disconnect semantics: a tripped desk stops being firm).
+        for (const q of this.rfqEngine.active) {
+          q.status = "expired";
+          q.note = "pulled: kill-switch (MMP)";
+          this.rfqEngine.pushRecentPublic(q);
+        }
+        this.rfqEngine.active = [];
         this.venue.step(dt, this.estSigma(), { bid: [], ask: [] }, this.steps);
+        this.options.step(dt);
+        this.optNet = this.options.netGreeks(this.venue.mid, this.options.surface());
+        this.hedge();
         this.clock += dt;
         this.steps++;
+        this.peakEquity = Math.max(this.peakEquity, this.totalEquity());
         this.recordPerf(t0);
         return;
       }
@@ -270,6 +342,14 @@ export class MarketMaker {
     const fills = this.venue.step(dt, sigma, this.lastQuotes, this.steps);
     this.cu += fills.length * 10 + 6;
     this.ops += fills.length;
+    // intensity learning: realized fills at their distances (ticks from
+    // the pre-step mid) feed the online Cox MLE
+    for (const f of fills) {
+      // intensity calibration excludes swept/toxic prints — they are not
+      // Cox-distance fills and would flatten the estimated decay
+      if (!f.toxic) this.learner.observeFill(Math.abs(mid0 - f.price) / this.venue.cfg.tickSize);
+    }
+    this.cu += 2;
 
     // --- option market ---
     const surface = this.options.surface();
@@ -277,11 +357,48 @@ export class MarketMaker {
     this.cu += 6;
     const optMm = this.optMm();
     const vv = this.vvFor(surface);
-    const optFills = this.options.clientStep(dt, this.venue.mid, surface, optMm, this.optNet.vega, vv);
+    // per-expiry vega buckets: each pillar's quotes lean against its own
+    // term-structure inventory (eSSVI-style surface control)
+    this.vegaPerExp = this.options.vegaPerExpiry(this.venue.mid, surface);
+    this.cu += 6;
+    // risk-gated option intake: one-sided vol quoting at the vega limit,
+    // per-leg wind-down of the book at the gross hedge cap
+    const optFills = this.options.clientStep(dt, this.venue.mid, surface, optMm, this.vegaPerExp, vv, this.riskGate());
     this.cu += 12 + optFills.length * 14;
     this.ops += optFills.length;
     this.recentOptFills.push(...optFills);
     if (this.recentOptFills.length > 24) this.recentOptFills.splice(0, this.recentOptFills.length - 24);
+
+    // --- RFQ lane: institutional flow, TTL decay, atomic executions ---
+    const rfqCtx: RfqRiskCtx = {
+      unhedgedLots: this.unhedgedLots(),
+      netDeltaLimit: this.netDeltaLimit,
+      netVega: this.optNet.vega,
+      vegaLimit: this.vegaLimit,
+      freeze: this.marginState.utilization >= 0.9,
+      lotSize: this.venue.cfg.lotSize,
+      multiplier: this.options.cfg.multiplier,
+      clock: this.clock,
+    };
+    const touches = this.rfqEngine.step(dt, this.venue.mid, this.options, optMm, surface, this.vegaPerExp, vv, rfqCtx);
+    // governed surface: executed single-leg RFQ touches anchor the pillars
+    for (const t of touches) this.options.anchorAtm(t.expIdx, t.iv, 0.12);
+    this.cu += 10;
+
+    // --- portfolio margin (SFPM scan, amortized over 20 steps) ---
+    if (this.marginAge >= 20) {
+      this.marginAge = 0;
+      this.marginState = portfolioMargin(
+        this.venue.mid,
+        this.options.marginLegs(this.venue.mid, surface),
+        this.venue.position,
+        this.venue.cfg.lotSize,
+        this.totalEquity(),
+        this.options.cfg.multiplier,
+      );
+    }
+    this.marginAge++;
+    this.cu += 2;
 
     // --- estimators ---
     const mid = this.venue.mid;
@@ -323,16 +440,47 @@ export class MarketMaker {
     if (this.latencies.length > 512) this.latencies.shift();
   }
 
-  /** Perp quote ladder for the active strategy (one-sided near limits). */
+  /** Perp quote ladder for the active strategy, risk-gated on the UNHEDGED
+   *  combined delta (hedge leg + option book): near the limit the desk
+   *  drops the risk-adding side and tightens the unwind side; at the limit
+   *  it quotes unwind-only at the touch. Never both-sides-off — blocking
+   *  risk-REDUCING trades would freeze the exposure (the classic dead-lock
+   *  risk engines must avoid: the unwind path always stays live). */
   perpQuotes(dt: number, sigma: number): { bid: PerpQuoteLevel[]; ask: PerpQuoteLevel[] } {
     const full = this.perpQuotesInner(dt, sigma);
-    // inventory gating: stop quoting the side that adds inventory when
-    // within 25% of the hard limit (the desk trades out, not breaches)
-    const pos = this.venue.position;
-    const lim = this.positionLimit;
-    if (pos > lim * 0.75) full.bid = [];
-    if (pos < -lim * 0.75) full.ask = [];
-    return full;
+    const unhedged = this.unhedgedLots();
+    const lim = this.netDeltaLimit;
+    const tick = this.venue.cfg.tickSize;
+    const mid = this.venue.mid;
+    const lvl = (p: number, sz: number): PerpQuoteLevel => ({ p: Math.round(p / tick) * tick, sz });
+    let out: { bid: PerpQuoteLevel[]; ask: PerpQuoteLevel[] };
+    if (Math.abs(unhedged) >= lim) {
+      // hard breach: unwind-only at the touch with boosted size — Cox
+      // fill intensity at δ≈0 sheds the excess within seconds, then the
+      // book self-recovers to two-sided quoting (hysteresis by band)
+      out =
+        unhedged > 0
+          ? { bid: [], ask: [lvl(mid + tick, 8), lvl(mid + 2 * tick, 12)] }
+          : { bid: [lvl(mid - 2 * tick, 12), lvl(mid - tick, 8)], ask: [] };
+    } else if (Math.abs(unhedged) >= lim * 0.75) {
+      // soft band: drop the adding side; pull the unwind side closer and
+      // deepen it so the book actively trades out of the excess
+      const k = 0.6;
+      const tighten = (lv: PerpQuoteLevel[]) =>
+        lv.map((l) => ({ p: Math.round((mid + (l.p - mid) * k) / tick) * tick, sz: Math.max(2, Math.round(l.sz * 1.5)) }));
+      out = unhedged > 0 ? { bid: [], ask: tighten(full.ask) } : { bid: tighten(full.bid), ask: [] };
+    } else {
+      out = full;
+    }
+    // intensity learning: record what is actually RESTING (post-gating)
+    this.learner.observeExposure(
+      [
+        ...out.bid.map((l) => ({ distTicks: Math.max(0, (mid - l.p) / tick), active: true })),
+        ...out.ask.map((l) => ({ distTicks: Math.max(0, (l.p - mid) / tick), active: true })),
+      ],
+      dt,
+    );
+    return out;
   }
 
   private perpQuotesInner(dt: number, sigma: number): { bid: PerpQuoteLevel[]; ask: PerpQuoteLevel[] } {
@@ -340,93 +488,108 @@ export class MarketMaker {
     const tick = v.cfg.tickSize;
     const mid = v.mid;
     const q = v.position + this.optNet.delta / v.cfg.lotSize;
-    const mult = v.markouts.multiplier;
+    // directional spread adaptation (Albers et al. 2025): fill likelihood
+    // and post-fill returns trade off per side — widen the TOXIC side only
+    const multB = v.markoutsBid.multiplier;
+    const multA = v.markoutsAsk.multiplier;
+    // learned fill intensity (online Cox MLE, shrunk toward the prior)
+    const kappa = clamp(this.learner.kappaUsed(), 0.1, 3);
+    const aI = clamp(this.learner.aUsed(), 1e-3, 3);
     const lvl = (p: number, sz: number): PerpQuoteLevel => ({ p: Math.round(p / tick) * tick, sz });
     const size0 = 2;
     // price-units vol over the quoting horizon
     const sigmaH = Math.max(0.2, sigma * mid * Math.sqrt(this.params.horizon));
+    // funding carry (Le 2025 funding-aware MM): expected funding on the
+    // quoting horizon shifts the reservation price against the carry side
+    const carry = clamp(
+      (-q * v.fundingRate * Math.min(this.params.horizon, v.cfg.fundingInterval) * mid) / v.cfg.fundingInterval / 2,
+      -10 * tick,
+      10 * tick,
+    );
     const params: AsParams = {
       gamma: this.params.gamma,
       sigma: sigmaH,
-      kappa: this.params.kappa,
-      a: this.params.a,
+      kappa,
+      a: aI,
       t: 1,
     };
     const asHalf = asHalfSpread(params, 0);
 
     switch (this.strategy) {
       case "static": {
-        const h = this.params.staticTicks * tick * mult;
-        return { bid: [lvl(mid - h, size0)], ask: [lvl(mid + h, size0)] };
+        const h = this.params.staticTicks * tick;
+        return { bid: [lvl(mid - h * multB, size0)], ask: [lvl(mid + h * multA, size0)] };
       }
       case "as": {
-        const h = clamp(asHalf, 1.2 * tick, 20 * tick) * mult;
-        return { bid: [lvl(mid - h, size0)], ask: [lvl(mid + h, size0)] };
+        // unified AS: reservation price (inventory + funding carry) ± spread
+        const h = clamp(asHalf, 1.2 * tick, 20 * tick);
+        const r = mid - this.params.gamma * sigmaH * sigmaH * q + carry;
+        return { bid: [lvl(r - h * multB, size0)], ask: [lvl(r + h * multA, size0)] };
       }
       case "hjb": {
         if (!this.hjb || this.hjbAge > 120) {
-          const prob = defaultProblem(this.params.gamma, sigmaH, this.params.kappa, this.params.a, 1);
+          const prob = defaultProblem(this.params.gamma, sigmaH, kappa, aI, 1);
           this.hjb = new MmHjb({ ...prob, qMax: 10, nSteps: 240 });
           this.hjbAge = 0;
         }
         this.hjbAge++;
         const da = this.hjb.deltaAsk(clamp(Math.round(q), -10, 10), 0.02);
         const db = this.hjb.deltaBid(clamp(Math.round(q), -10, 10), 0.02);
-        const ha = clamp(isFinite(da) ? da : 20 * tick, 1.2 * tick, 20 * tick) * mult;
-        const hb = clamp(isFinite(db) ? db : 20 * tick, 1.2 * tick, 20 * tick) * mult;
-        return { bid: [lvl(mid - hb, size0)], ask: [lvl(mid + ha, size0)] };
+        const ha = clamp(isFinite(da) ? da : 20 * tick, 1.2 * tick, 20 * tick) * multA;
+        const hb = clamp(isFinite(db) ? db : 20 * tick, 1.2 * tick, 20 * tick) * multB;
+        return { bid: [lvl(mid + carry - hb, size0)], ask: [lvl(mid + carry + ha, size0)] };
       }
       case "queue": {
         // AS distance + Erlang fill-probability vs the away-move clock.
         const base = clamp(asHalf / tick, 1, 30);
-        const mu = this.params.a * 1.2;
+        const mu = aI * 1.2;
         const nu = clamp(sigma * 40, 0.05, 3);
         const pick = (dT: number) => {
           const m = Math.max(1, Math.round(dT));
           const p = Math.pow(mu / (mu + nu), m + 1);
-          return { m, score: m * tick * p * Math.exp(-this.params.kappa * (m * tick)) };
+          return { m, score: m * tick * p * Math.exp(-kappa * (m * tick)) };
         };
         let best = pick(base);
         for (let i = 1; i <= 4; i++) {
           const c = pick(base + i);
           if (c.score > best.score) best = c;
         }
-        const d = best.m * tick * mult;
-        return { bid: [lvl(mid - d, size0)], ask: [lvl(mid + d, size0)] };
+        return { bid: [lvl(mid - best.m * tick * multB, size0)], ask: [lvl(mid + best.m * tick * multA, size0)] };
       }
       case "micro": {
         const mp = microPrice(v.top.bid, v.top.ask, v.top.bidSz, v.top.askSz);
-        const h = Math.max(2 * tick, v.spread * 0.8 + asHalf * 0.4) * mult;
-        return { bid: [lvl(mp - h, size0)], ask: [lvl(mp + h, size0)] };
+        const h = Math.max(2 * tick, v.spread * 0.8 + asHalf * 0.4);
+        return { bid: [lvl(mp - h * multB, size0)], ask: [lvl(mp + h * multA, size0)] };
       }
       case "optmm": {
-        const h = Math.max(2 * tick, this.params.ladderBase * tick + asHalf * 0.35) * mult;
-        return { bid: [lvl(mid - h, size0)], ask: [lvl(mid + h, size0)] };
+        const h = Math.max(2 * tick, this.params.ladderBase * tick + asHalf * 0.35);
+        return { bid: [lvl(mid - h * multB, size0)], ask: [lvl(mid + h * multA, size0)] };
       }
       case "ladder": {
         const outB: PerpQuoteLevel[] = [];
         const outA: PerpQuoteLevel[] = [];
         const baseD = Math.max(this.params.ladderBase * tick, asHalf * 0.6);
         for (let i = 0; i < this.params.levels; i++) {
-          const d = baseD * (1 + 0.7 * i) * mult;
+          const d = baseD * (1 + 0.7 * i);
           const sz = size0 * (1 + 0.6 * i);
-          outB.push(lvl(mid - d, sz));
-          outA.push(lvl(mid + d, sz));
+          outB.push(lvl(mid - d * multB, sz));
+          outA.push(lvl(mid + d * multA, sz));
         }
         return { bid: outB, ask: outA };
       }
       case "volsurf":
       default: {
-        // combined-delta reservation skew + tiered ladder (skew clamped to
-        // 10 ticks — the reservation price is a tilt, not a regime)
-        const skew = clamp(-this.params.gamma * sigmaH * sigmaH * q, -10 * tick, 10 * tick);
+        // combined-delta reservation skew + funding carry + tiered ladder
+        // (skew clamped to 10 ticks — the reservation price is a tilt,
+        // not a regime)
+        const skew = clamp(-this.params.gamma * sigmaH * sigmaH * q + carry, -10 * tick, 10 * tick);
         const outB: PerpQuoteLevel[] = [];
         const outA: PerpQuoteLevel[] = [];
         const baseD = Math.max(2 * tick, asHalf * 0.7);
         for (let i = 0; i < this.params.levels; i++) {
-          const d = baseD * (1 + 0.6 * i) * mult;
-          outB.push(lvl(mid + skew - d, size0 * (1 + 0.5 * i)));
-          outA.push(lvl(mid + skew + d, size0 * (1 + 0.5 * i)));
+          const d = baseD * (1 + 0.6 * i);
+          outB.push(lvl(mid + skew - d * multB, size0 * (1 + 0.5 * i)));
+          outA.push(lvl(mid + skew + d * multA, size0 * (1 + 0.5 * i)));
         }
         return { bid: outB, ask: outA };
       }
@@ -468,6 +631,7 @@ export class MarketMaker {
         this.halted = false;
         this.haltReason = "";
         this.peakEquity = this.totalEquity();
+        this.logRiskEvent("risk-on after cooldown (peak re-anchored)");
       }
       return;
     }
@@ -479,14 +643,56 @@ export class MarketMaker {
       this.halted = true;
       this.haltedAt = this.clock;
       this.haltReason = `drawdown kill-switch (${(this.peakEquity - eq).toFixed(1)} > ${ddLimit.toFixed(1)})`;
-    } else if (Math.abs(this.venue.position) > this.positionLimit) {
-      this.halted = true;
-      this.haltedAt = this.clock;
-      this.haltReason = "perp position limit breach";
-    } else if (Math.abs(this.optNet.vega) > this.vegaLimit) {
-      this.halted = true;
-      this.haltedAt = this.clock;
-      this.haltReason = "vega limit breach";
+      this.logRiskEvent(`KILL-SWITCH — ${this.haltReason}; quotes off, hedge + marks live`);
+      return;
+    }
+    // --- limit gating: directional, self-recovering, never a freeze ---
+    // Limits bind on the UNHEDGED combined delta (not the raw hedge leg —
+    // the hedge is how a short-gamma book gets flat), on gross hedge-leg
+    // size as a sanity cap, on net vega, and on MARGIN UTILIZATION — the
+    // protocol-grade constraint (Derive SFPM / Paradex SCAN lineage):
+    // capital is the true limit, not lot counts. Breaches gate quoting
+    // one-sided toward unwind; they never halt the desk.
+    const unhedged = this.unhedgedLots();
+    const gross = Math.abs(this.venue.position);
+    const vega = Math.abs(this.optNet.vega);
+    const util = this.marginState.utilization;
+    let state: "nominal" | "gated" | "breach" = "nominal";
+    const on: string[] = [];
+    if (Math.abs(unhedged) >= this.netDeltaLimit) {
+      state = "breach";
+      on.push("net-delta");
+    } else if (Math.abs(unhedged) >= this.netDeltaLimit * 0.75) {
+      state = "gated";
+      on.push("net-delta");
+    }
+    if (gross >= this.grossHedgeCap) {
+      state = "breach";
+      on.push("gross-hedge");
+    }
+    if (vega >= this.vegaLimit) {
+      state = "breach";
+      on.push("vega");
+    } else if (vega >= this.vegaLimit * 0.75 && state === "nominal") {
+      state = "gated";
+      on.push("vega");
+    }
+    if (util >= 0.9) {
+      state = "breach";
+      on.push("margin");
+    } else if (util >= 0.7 && state === "nominal") {
+      state = "gated";
+      on.push("margin");
+    }
+    this.riskState = state;
+    this.gatedOn = on.join("+");
+    if (this.riskState !== this.lastRiskState) {
+      this.logRiskEvent(
+        this.riskState === "nominal"
+          ? "risk nominal — quoting live both sides"
+          : `risk ${this.riskState} (${this.gatedOn}) — risk-adding side gated, unwind side live`,
+      );
+      this.lastRiskState = this.riskState;
     }
   }
 
@@ -494,12 +700,93 @@ export class MarketMaker {
     return this.venue.equity + this.options.cash + this.optNet.mark;
   }
 
-  /** Risk-manager resume: clear the halt and re-anchor the peak. */
+  /** Risk-manager resume: clear a kill-switch halt and re-anchor the peak. */
   resume() {
+    if (this.halted) this.logRiskEvent("manual risk-manager resume");
     this.halted = false;
     this.haltReason = "";
     this.haltedAt = -1;
     this.peakEquity = this.totalEquity();
+  }
+
+  /** The combined delta the desk actually carries: hedge leg + option book. */
+  unhedgedLots(): number {
+    return this.venue.position + (this.optNet.delta * this.options.cfg.multiplier) / this.venue.cfg.lotSize;
+  }
+
+  /** Option-flow risk gate: vega one-siding at the limit, per-leg wind-down
+   *  of the book at the gross hedge cap or hard margin breach (only
+   *  risk-REDUCING fills served). */
+  private riskGate(): RiskGate {
+    const vegaOver = Math.abs(this.optNet.vega) >= this.vegaLimit;
+    const grossOver = Math.abs(this.venue.position) >= this.grossHedgeCap;
+    const marginHard = this.marginState.utilization >= 0.9;
+    return {
+      blockVolBid: vegaOver && this.optNet.vega > 0,
+      blockVolAsk: vegaOver && this.optNet.vega < 0,
+      windDown: grossOver || marginHard,
+    };
+  }
+
+  /** Manual RFQ: the UI taker requests a firm package quote. Returns the
+   *  quote id (firm for the TTL window — Paradigm/Derive hold-for-time). */
+  requestRfq(templateId: string, lots: number, expIdx?: number): number | null {
+    const tpl = RFQ_TEMPLATES.find((t) => t.id === templateId);
+    if (!tpl) return null;
+    const e = clamp(expIdx ?? this.selectedExp, 0, this.options.cfg.expiries.length - 1);
+    const { legs, label } = this.rfqEngine.buildPackage(tpl, e, lots, this.options);
+    const surface = this.options.surface();
+    const optMm = this.optMm();
+    const vpe = this.vegaPerExp.length ? this.vegaPerExp : this.options.vegaPerExpiry(this.venue.mid, surface);
+    const q = this.rfqEngine.quote(legs, label, "manual", this.venue.mid, this.options, optMm, surface, vpe, this.vvFor(surface), 99999);
+    this.rfqEngine.active.push(q);
+    return q.id;
+  }
+
+  /** Cancel a manual quote (the UI taker's real-time firm window elapsed). */
+  cancelRfq(id: number) {
+    const q = this.rfqEngine.active.find((x) => x.id === id);
+    if (!q) return;
+    q.status = "expired";
+    q.note = "expired — firm window elapsed";
+    this.rfqEngine.pushRecentPublic(q);
+    this.rfqEngine.active = this.rfqEngine.active.filter((x) => x.status === "quoted");
+  }
+
+  /** Execute a quoted RFQ package atomically (desk side). */
+  executeRfq(id: number, side: "desk-buys" | "desk-sells"): { ok: boolean; reason?: string } {
+    const surface = this.options.surface();
+    const optMm = this.optMm();
+    const vpe = this.vegaPerExp.length ? this.vegaPerExp : this.options.vegaPerExpiry(this.venue.mid, surface);
+    const ctx: RfqRiskCtx = {
+      unhedgedLots: this.unhedgedLots(),
+      netDeltaLimit: this.netDeltaLimit,
+      netVega: this.optNet.vega,
+      vegaLimit: this.vegaLimit,
+      freeze: this.marginState.utilization >= 0.9,
+      lotSize: this.venue.cfg.lotSize,
+      multiplier: this.options.cfg.multiplier,
+      clock: this.clock,
+    };
+    const res = this.rfqEngine.execute(id, side, this.venue.mid, this.options, optMm, surface, vpe, this.vvFor(surface), ctx);
+    if (res.ok) {
+      // the margin scan is stale after a package execution — refresh now
+      this.marginState = portfolioMargin(
+        this.venue.mid,
+        this.options.marginLegs(this.venue.mid, surface),
+        this.venue.position,
+        this.venue.cfg.lotSize,
+        this.totalEquity(),
+        this.options.cfg.multiplier,
+      );
+      this.marginAge = 0;
+    }
+    return res;
+  }
+
+  private logRiskEvent(msg: string) {
+    this.riskEventTape.push({ t: Math.round(this.clock), msg });
+    if (this.riskEventTape.length > 16) this.riskEventTape.shift();
   }
 
   /** Build the immutable UI snapshot. */
@@ -512,6 +799,9 @@ export class MarketMaker {
     const net = this.options.netGreeks(s, surface);
     const e = this.options.cfg.expiries.length;
     const m = this.options.cfg.moneyness.length;
+    // per-expiry net vega (term-structure buckets) — before the chain so
+    // pillar quotes lean against their own inventory
+    const vegaPerExp = this.vegaPerExp.length === e ? this.vegaPerExp.slice() : this.options.vegaPerExpiry(s, surface);
     const surfaceGrid: number[][] = [];
     for (let ei = 0; ei < e; ei++) {
       const row: number[] = [];
@@ -521,10 +811,11 @@ export class MarketMaker {
       surfaceGrid.push(row);
     }
     const sel = clamp(this.selectedExp, 0, e - 1);
+    const vegaSel = vegaPerExp[sel] ?? net.vega;
     const chain: ChainRow[] = this.options.cfg.moneyness.map((mo, li) => {
       const strike = Math.exp(mo) * s;
-      const qc = this.options.quotes(sel, li, "call", s, surface, optMm, net.vega, vv);
-      const qp = this.options.quotes(sel, li, "put", s, surface, optMm, net.vega, vv);
+      const qc = this.options.quotes(sel, li, "call", s, surface, optMm, vegaSel, vv);
+      const qp = this.options.quotes(sel, li, "put", s, surface, optMm, vegaSel, vv);
       const gc = fullGreeks("call", s, strike, 0, 0, qc.ivFair, this.options.cfg.expiries[sel]);
       return {
         moneyness: mo,
@@ -535,26 +826,10 @@ export class MarketMaker {
       };
     });
     const vvp = vv.portfolioCharge(net.vanna, net.volga, Math.max(Math.abs(net.vega), 1e-9));
-    // per-expiry net vega
-    const vegaPerExp: number[] = [];
-    for (let e = 0; e < this.options.cfg.expiries.length; e++) {
-      const t = this.options.cfg.expiries[e];
-      let vegaE = 0;
-      for (let l = 0; l < this.options.cfg.moneyness.length; l++) {
-        const strike = Math.exp(this.options.cfg.moneyness[l]) * s;
-        const iv = surface.iv(this.options.cfg.moneyness[l], t);
-        for (let ki = 0; ki < 2; ki++) {
-          const lots = this.options.pos[e][l][ki];
-          if (lots === 0) continue;
-          vegaE += fullGreeks(ki === 0 ? "call" : "put", s, strike, 0, 0, iv, t).vega * lots;
-        }
-      }
-      vegaPerExp.push(vegaE);
-    }
     const lat = this.latencies.slice().sort((a, b) => a - b);
     const p50 = lat.length ? lat[Math.floor(lat.length * 0.5)] : 0;
     const p99 = lat.length ? lat[Math.floor(lat.length * 0.99)] : 0;
-    const unhedged = v.position + net.delta / v.cfg.lotSize;
+    const unhedged = v.position + (net.delta * this.options.cfg.multiplier) / v.cfg.lotSize;
     return {
       clock: this.clock,
       steps: this.steps,
@@ -583,20 +858,54 @@ export class MarketMaker {
         inventory: v.inventoryPnl(),
         fees: -v.feesPaid,
         hedgeCost: -v.hedgeFees,
+        funding: -v.fundingPaid,
         optionPremium: this.options.cash,
         optionMark: net.mark,
         total: this.totalEquity(),
       },
       quotes: this.lastQuotes,
       strategy: this.strategy,
-      markouts: v.markouts.state(),
+      markouts: { ...v.markouts.state(), multBid: v.markoutsBid.multiplier, multAsk: v.markoutsAsk.multiplier },
+      funding: {
+        rate: v.fundingRate,
+        premiumIndex: v.premiumIndex,
+        nextIn: Math.max(0, v.cfg.fundingInterval - v.fundingElapsed),
+        interval: v.cfg.fundingInterval,
+        paid: v.fundingPaid,
+        index: v.index,
+        carrySkew: clamp(
+          (-(v.position + net.delta / v.cfg.lotSize) * v.fundingRate * Math.min(this.params.horizon, v.cfg.fundingInterval) * s) /
+            v.cfg.fundingInterval /
+            2,
+          -10 * v.cfg.tickSize,
+          10 * v.cfg.tickSize,
+        ),
+      },
+      learned: this.learner.state(),
+      rfq: {
+        active: this.rfqEngine.active.map((qq) => ({ ...qq, legs: qq.legs.map((l) => ({ ...l })) })),
+        recent: this.rfqEngine.recent.slice(-8),
+        executions: this.rfqEngine.executions.slice(-10),
+        requests: this.rfqEngine.requests,
+        executed: this.rfqEngine.executed,
+        refused: this.rfqEngine.refused,
+        premiumFlow: this.rfqEngine.premiumFlow,
+      },
+      margin: this.marginState,
       risk: {
-        positionLimit: this.positionLimit,
+        netDeltaLimit: this.netDeltaLimit,
+        grossHedgeCap: this.grossHedgeCap,
         vegaLimit: this.vegaLimit,
         vegaUsed: Math.abs(net.vega),
+        netDelta: unhedged,
+        grossHedge: Math.abs(v.position),
         drawdown: this.peakEquity - this.totalEquity(),
+        state: this.halted ? "halted" : this.riskState,
+        gatedOn: this.gatedOn,
+        windDown: Math.abs(v.position) >= this.grossHedgeCap,
         halted: this.halted,
         haltReason: this.haltReason,
+        events: this.riskEventTape.slice(-8),
       },
       options: {
         expiries: this.options.cfg.expiries,

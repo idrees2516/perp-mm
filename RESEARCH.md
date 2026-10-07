@@ -364,3 +364,85 @@ segmentation literature)
   fill's own captured edge made the toxicity estimator saturate; caught
   by Study C's adaptive-worse-than-static result, fixed so the
   controller converges to the impact-aware optimum.
+
+---
+
+# Stage 4 — risk-engine v2, protocol lanes, and the Φ bug (2026-10)
+
+*Sources: Paradex/TradeParadigm RFQ integration coverage (OI ×2.6 to
+$202M after the Paradigm RFQ engine went live), Derive V3 launch
+coverage (RFQ options, sub-ms matching, SFPM portfolio margin), Deribit
+listed conventions (SOMC, block trades), Albers et al. 2025 "The Market
+Maker's Dilemma: Navigating the Fill Probability vs. Post-Fill Returns
+Trade-Off", Le 2025/26 "Funding-Aware Optimal Market Making for
+Perpetual DEXs", Zhang 2025 "Risk-Sensitive Option Market Making with
+Arbitrage-Free eSSVI Surfaces", Jäckel 2015 "Let's Be Rational".*
+
+## The bug that motivated stage 4
+
+The web engine's risk check halted the desk when the RAW perp position
+— which is the delta HEDGE leg — crossed a lot-count limit. A properly
+delta-hedged options book (unhedged ≈ 2 lots, hedge ≈ 62) was treated as
+a breach; the halt then froze quoting, the option market AND the
+hedger, so the position could never work off: `risk-manager resume`
+re-halted within one step and the desk spent up to 63% of its life
+deadlocked (reproduced across 6 seeds). The fix is the real-desk
+doctrine, now in both engines:
+
+1. **Limits bind on the UNHEDGED combined delta** (hedge leg + option
+   book), never on the raw hedge size; a gross hedge-leg cap remains as
+   a sanity bound.
+2. **Limit breaches gate directionally and self-recover** — soft band
+   (75%): drop the risk-adding side, tighten + deepen the unwind side;
+   hard breach: unwind-only quotes at the touch. Never both-sides-off:
+   blocking risk-REDUCING trades freezes the exposure a risk engine
+   exists to shed.
+3. **Kill-switch (drawdown only) keeps risk-reducing paths live**: the
+   hedge, marks and surface keep running through risk-off; firm RFQ
+   quotes are pulled (Derive MMP / cancel-on-disconnect semantics).
+4. **Margin utilization is the protocol-grade limit** (SFPM): soft 70%
+   gates, hard 90% winds the option book down (only position-reducing
+   fills served).
+
+Post-fix: 40-seed scan shows zero limit-halt loops; the worst seed
+(63% deadlocked) now quotes both sides 3000/3000 steps; 12-seed
+sustainability at 0.62% halted (kill-switch cycles only).
+
+## New engine capability (paper → implementation map)
+
+| Source | Implementation | Validation |
+|---|---|---|
+| Paradigm/TradeParadigm-on-Paradex + Derive V3 RFQ | `engine::rfq` (Rust) + `src/lib/engine/rfq.ts` (web): multi-leg packages (verticals, butterflies, condors / 10 templates incl. straddles, risk reversals, calendars, boxes on the web side), firm quotes with TTL, ATOMIC all-or-nothing execution, combo margin offsets shared with the taker as tighter package spreads, single-leg executions anchor the governed vol surface (Paradex shape) | atomicity (all legs move or none), box ≫ straddle offset ordering, net-delta/vega/leg-limit refusals leave the book untouched, TTL expiry sweeps, wall-clock firm windows for the manual taker |
+| Derive V3 SFPM / Paradex SCAN / Deribit SOMC | `engine::margin` + `src/lib/engine/margin.ts`: spot×vol scenario grid + time-decay scan, worst-loss ∨ short-option-minimum floor, 1.2× initial buffer, utilization-gated risk | hedged books cut spot scenarios, short straddles require margin, perp-only books price off the spot scan, flat books are free |
+| Albers et al. 2025 (fill-prob vs post-fill trade-off) | per-side markout trackers: the spread response widens only the TOXIC side | wired into all 8 strategies on the web engine |
+| Le 2025 (funding-aware MM) | funding stream: premium-index EWMA, BitMEX-shape rate with clamps, per-interval payments, reservation-price carry skew | rate bounded by the clamp, payments signed correctly, carry leans against the paying side |
+| Zhang 2025 (eSSVI risk-sensitive control) | per-expiry vega buckets drive per-pillar GLFT quotes (term-structure-aware inventory) instead of blinding the whole chain with the aggregate | vegaPerExpiry feeds both the quoter and the RFQ package pricer |
+| Jäckel 2015 (Let's Be Rational) | `vol::solver::implied_vol_fast` + `bsm.impliedVolFast`: OTM parity fold, normalized strike units, rational seed + Halley (Householder-2) iterations, relative-precision fallback to the bracketed solver | machine precision (|Δσ| < 1e-9) across the moneyness/maturity/vol grid wherever the premium carries digits (b > 1e-6); graceful degradation below the double-precision floor; ~2-5× fewer evaluations than Newton+bisection |
+| Self-learned intensity (adaptive-desk lineage) | online Cox-intensity MLE: exposure integral at the running κ̂, method-of-moments for A, score climbing for κ, exponential forgetting, count-based shrinkage; calibrated on non-swept prints only (real desks exclude swept/odd-lot) | recovers (A, κ) on a synthetic pure-Cox process; tracks the venue's realized mixture process (Cox core + informed boosts) |
+
+## The Φ bug (web engine)
+
+The Hart/West ncdf port evaluated its rational polynomial at (z/2)²
+instead of z² — every normal CDF value was wrong (ncdf(0.25) = 0.71 vs
+0.5987 true). The engine had been *self-consistent* on a wrong Φ: all
+premiums, greeks, SSVI no-arb checks and vanna-volga shifts were
+computed with it, so nothing visibly broke until the IV-solver grid
+test disagreed with the reference. Rebuilt from first principles:
+erf Maclaurin (exact term recurrence) in the central region + the
+Laplace continued fraction for the Mills ratio in the tail —
+|ΔΦ| ≤ 8e-15 over ±8 against C-libm erf, ~211 ns/call. The Rust
+`micro::special::erf` was already correct (its own reference tests
+caught nothing because there was nothing to catch); only the TS port
+was garbled.
+
+## Desk calibration notes
+
+- Web-engine capital raised 1000 → 2500: at the sim's book scale
+  (gross short ~150-200 lots against ~2.5-5k equity) SOMC binds at
+  60-85% utilization — the desk trades against its capital constraint
+  exactly as a real SFPM desk does (risk events show margin-gated
+  cycles with self-recovery).
+- RFQ freeze binds at the hard margin band only (0.9): the soft band
+  tightens, it does not freeze.
+- Institutional arrival intensity: one package per ~40 s (web) / ~20 s
+  (Rust sim clock), sizes 5-25× the retail request.

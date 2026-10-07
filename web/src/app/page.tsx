@@ -1,16 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useEngine } from "@/lib/engine/useEngine";
 import type { StrategyId } from "@/lib/engine/engine";
 import { INITIAL_CAPITAL } from "@/lib/engine/engine";
+import { RFQ_TEMPLATES } from "@/lib/engine/rfq";
 import { Sparkline, LineChart, Heatmap, SignedBar, DepthLadder, StatChip, Panel } from "@/components/terminal/charts";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Pause, Play, RotateCcw, Zap, Activity, Layers, Gauge, LineChart as LineIcon, Grid3x3, Scale, Brain, ShieldAlert } from "lucide-react";
+import { Pause, Play, RotateCcw, Zap, Activity, Layers, Gauge, LineChart as LineIcon, Grid3x3, Scale, Brain, ShieldAlert, Handshake, Landmark, Coins } from "lucide-react";
 
 const fmt = (v: number, d = 2) => (isFinite(v) ? v.toFixed(d) : "—");
 const vp = (v: number, d = 2) => (isFinite(v) ? (v * 100).toFixed(d) : "—"); // vol points
@@ -93,6 +94,25 @@ export default function Home() {
   const eng = useEngine(12345);
   const snap = eng.snap;
   const [tab, setTab] = useState("terminal");
+  const [rfqTpl, setRfqTpl] = useState("call-spread");
+  const [rfqLots, setRfqLots] = useState(10);
+  const [rfqMsg, setRfqMsg] = useState<string | null>(null);
+  /** Real-time firm windows for manual quotes (id → wall-clock deadline ms). */
+  const [manualFirm, setManualFirm] = useState<Record<number, number>>({});
+  const firmRef = useRef<Record<number, number>>({});
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const now = Date.now();
+      for (const [id, dl] of Object.entries(firmRef.current)) {
+        if (now > dl) {
+          eng.cancelRfq(Number(id));
+          delete firmRef.current[Number(id)];
+          setManualFirm({ ...firmRef.current });
+        }
+      }
+    }, 400);
+    return () => clearInterval(iv);
+  }, [eng]);
 
   if (!snap) {
     return (
@@ -125,7 +145,7 @@ export default function Home() {
           <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
             <StatChip label="spot" value={fmt(snap.spot)} sub={`mid ${fmt(snap.micro.microPrice)}`} />
             <StatChip label="pnl" value={`${pnl > 0 ? "+" : ""}${fmt(pnl, 1)}`} tone={pnlTone} sub={`${pnlPct > 0 ? "+" : ""}${pnlPct.toFixed(1)}% · eq ${fmt(snap.equity, 0)}`} />
-            <StatChip label="perp pos" value={`${snap.position > 0 ? "+" : ""}${snap.position}`} tone={snap.position > 0 ? "pos" : snap.position < 0 ? "neg" : "neutral"} sub={`limit ${snap.risk.positionLimit}`} />
+            <StatChip label="perp pos" value={`${snap.position > 0 ? "+" : ""}${snap.position}`} tone={snap.position > 0 ? "pos" : snap.position < 0 ? "neg" : "neutral"} sub={`net Δ ${fmt(snap.risk.netDelta, 0)} / ${snap.risk.netDeltaLimit}`} />
             <StatChip label="net vega" value={fmt(o.net.vega, 0)} tone={o.net.vega > 0 ? "pos" : "neg"} sub={`limit ${snap.risk.vegaLimit}`} />
             <StatChip label="opt fills" value={`${o.fills}`} sub={`hedges ${o.hedgeLotsTotal}`} />
             <StatChip label="markout ×" value={fmt(snap.markouts.multiplier)} tone={snap.markouts.multiplier > 1.3 ? "warn" : "neutral"} sub={`tox ${(snap.markouts.toxicity * 100).toFixed(0)}%`} />
@@ -158,9 +178,18 @@ export default function Home() {
         {!snap.running && (
           <div className="max-w-[1440px] mx-auto mt-1.5 flex items-center gap-3">
             <Badge variant="destructive" className="text-[10px] font-mono">HALTED — {snap.risk.haltReason}</Badge>
+            <span className="font-mono text-[9px] text-neutral-500">quotes off · hedge + marks live · auto risk-on in 30 s</span>
             <Button size="sm" variant="outline" onClick={eng.resume} className="h-6 px-2 text-[10px] font-mono border-amber-600/50 text-amber-300 hover:bg-amber-500/10">
               risk-manager resume
             </Button>
+          </div>
+        )}
+        {(snap.risk.state === "gated" || snap.risk.state === "breach") && snap.running && (
+          <div className="max-w-[1440px] mx-auto mt-1.5 flex flex-wrap items-center gap-2">
+            <Badge className="text-[10px] font-mono border-amber-600/50 bg-amber-500/10 text-amber-300 hover:bg-amber-500/10">
+              RISK-{snap.risk.state.toUpperCase()} · {snap.risk.gatedOn} — {snap.risk.netDelta > 0 ? "bids gated" : snap.risk.netDelta < 0 ? "asks gated" : "intake gated"}, unwind side live
+            </Badge>
+            <span className="font-mono text-[9px] text-neutral-500">self-recovering: desk trades out instead of halting</span>
           </div>
         )}
       </header>
@@ -173,6 +202,7 @@ export default function Home() {
             <TabsTrigger value="chain" className="text-[11px] gap-1.5 data-[state=active]:bg-emerald-500/15 data-[state=active]:text-emerald-300"><Layers className="h-3 w-3" />Option Chain</TabsTrigger>
             <TabsTrigger value="surface" className="text-[11px] gap-1.5 data-[state=active]:bg-emerald-500/15 data-[state=active]:text-emerald-300"><Grid3x3 className="h-3 w-3" />Vol Surface</TabsTrigger>
             <TabsTrigger value="greeks" className="text-[11px] gap-1.5 data-[state=active]:bg-emerald-500/15 data-[state=active]:text-emerald-300"><Scale className="h-3 w-3" />Greeks & Hedge</TabsTrigger>
+            <TabsTrigger value="rfq" className="text-[11px] gap-1.5 data-[state=active]:bg-emerald-500/15 data-[state=active]:text-emerald-300"><Handshake className="h-3 w-3" />RFQ · Margin</TabsTrigger>
             <TabsTrigger value="strategy" className="text-[11px] gap-1.5 data-[state=active]:bg-emerald-500/15 data-[state=active]:text-emerald-300"><Brain className="h-3 w-3" />Strategy</TabsTrigger>
             <TabsTrigger value="risk" className="text-[11px] gap-1.5 data-[state=active]:bg-emerald-500/15 data-[state=active]:text-emerald-300"><ShieldAlert className="h-3 w-3" />Micro · Risk · PnL</TabsTrigger>
           </TabsList>
@@ -500,6 +530,252 @@ export default function Home() {
             </Panel>
           </TabsContent>
 
+          {/* ============================================ TAB: rfq / margin */}
+          <TabsContent value="rfq" className="mt-3 grid gap-3 lg:grid-cols-3">
+            <Panel title="RFQ desk — multi-leg packages · firm quotes (TTL) · atomic execution" className="lg:col-span-2">
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {RFQ_TEMPLATES.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => setRfqTpl(t.id)}
+                      title={t.blurb}
+                      className={`rounded border px-2 py-1 font-mono text-[10px] transition-colors ${
+                        rfqTpl === t.id
+                          ? "border-emerald-600/60 bg-emerald-500/15 text-emerald-300"
+                          : "border-neutral-800 bg-neutral-900/60 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200"
+                      }`}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center gap-3">
+                  <div className="flex-1">
+                    <div className="flex justify-between text-[10px] font-mono mb-1">
+                      <span className="text-neutral-500">package size (lots)</span>
+                      <span className="text-neutral-200">{rfqLots}</span>
+                    </div>
+                    <Slider value={[rfqLots]} min={5} max={25} step={1} onValueChange={(v) => setRfqLots(v[0])} aria-label="rfq lots" />
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      const id = eng.requestRfq(rfqTpl, rfqLots);
+                      if (id !== null) {
+                        firmRef.current[id] = Date.now() + 15000;
+                        setManualFirm({ ...firmRef.current });
+                      }
+                      setRfqMsg(id === null ? "unknown template" : `quoted #${id} — firm for 15 s wall-clock (Paradigm/Derive hold-for-time)`);
+                    }}
+                    className="h-7 px-3 text-[10px] font-mono border-emerald-600/50 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20"
+                    variant="outline"
+                  >
+                    request quote
+                  </Button>
+                </div>
+                {rfqMsg && <div className="font-mono text-[9px] text-neutral-500">{rfqMsg}</div>}
+                <div className="space-y-2">
+                  {snap.rfq.active.map((q) => (
+                    <div key={q.id} className="rounded border border-neutral-800 bg-neutral-900/50 p-2">
+                      <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                        <span className="font-mono text-[11px] text-neutral-200">{q.label}</span>
+                        <Badge className={`text-[9px] font-mono ${q.origin === "manual" ? "border-sky-600/50 bg-sky-500/10 text-sky-300" : "border-violet-600/50 bg-violet-500/10 text-violet-300"}`}>
+                          {q.origin === "manual" ? "MANUAL TAKER" : "INSTITUTIONAL"}
+                        </Badge>
+                        <Badge className="text-[9px] font-mono border-amber-600/40 bg-amber-500/10 text-amber-300">
+                          offset {(q.marginOffset * 100).toFixed(0)}%
+                        </Badge>
+                        <span className="font-mono text-[9px] text-neutral-500">{q.lots} lots</span>
+                        <div className="ml-auto flex items-center gap-2">
+                          <div className="w-16 h-1.5 rounded bg-neutral-800 overflow-hidden">
+                            {q.origin === "manual" ? (
+                              <div className="h-full bg-sky-500/70" style={{ width: `${Math.max(0, Math.min(100, (((manualFirm[q.id] ?? Date.now()) - Date.now()) / 15000) * 100))}%` }} />
+                            ) : (
+                              <div className="h-full bg-amber-500/70" style={{ width: `${Math.max(0, Math.min(100, (q.ttl / q.totalTtl) * 100))}%` }} />
+                            )}
+                          </div>
+                          <span className="font-mono text-[9px] text-neutral-500">
+                            {q.origin === "manual"
+                              ? `${Math.max(0, ((manualFirm[q.id] ?? Date.now()) - Date.now()) / 1000).toFixed(1)}s`
+                              : `${q.ttl.toFixed(1)}s`}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 font-mono text-[9px]">
+                        {q.legs.map((l, i) => (
+                          <div key={i} className="contents">
+                            <span className={l.dir > 0 ? "text-emerald-400" : "text-rose-400"}>
+                              {l.dir > 0 ? "+" : "−"}{l.kind === "call" ? "C" : "P"} {fmt(l.strike, 1)} {expLabel(l.t)}
+                            </span>
+                            <span className="text-neutral-500">
+                              iv {vp(l.ivBid, 1)} / {vp(l.ivAsk, 1)} · leg fair {fmt(l.premFair, 2)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[10px]">
+                        <span className="text-emerald-400">desk buys @ {fmt(q.bid)}</span>
+                        <span className="text-neutral-400">fair {fmt(q.fair)}</span>
+                        <span className="text-rose-400">desk sells @ {fmt(q.ask)}</span>
+                        <span className="text-neutral-500">Δ {fmt(q.delta, 1)} · Γ {fmt(q.gamma, 3)} · V {fmt(q.vega, 0)}</span>
+                        {q.note && <span className="text-amber-400/80 text-[9px]">{q.note}</span>}
+                      </div>
+                      <div className="mt-1.5 flex gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={q.status !== "quoted"}
+                          onClick={() => {
+                            const res = eng.executeRfq(q.id, "desk-buys");
+                            setRfqMsg(res.ok ? `executed #${q.id} ${q.label} — desk BUYS @ ${fmt(q.bid)}` : `refused: ${res.reason}`);
+                          }}
+                          className="h-6 px-2 text-[9px] font-mono border-emerald-600/50 text-emerald-300 hover:bg-emerald-500/10"
+                        >
+                          execute — desk buys
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={q.status !== "quoted"}
+                          onClick={() => {
+                            const res = eng.executeRfq(q.id, "desk-sells");
+                            setRfqMsg(res.ok ? `executed #${q.id} ${q.label} — desk SELLS @ ${fmt(q.ask)}` : `refused: ${res.reason}`);
+                          }}
+                          className="h-6 px-2 text-[9px] font-mono border-rose-600/50 text-rose-300 hover:bg-rose-500/10"
+                        >
+                          execute — desk sells
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                  {!snap.rfq.active.length && (
+                    <div className="rounded border border-dashed border-neutral-800 p-3 font-mono text-[10px] text-neutral-600">
+                      no firm quotes — request one above, or wait for the institutional flow (arrivals every ~40 s)
+                    </div>
+                  )}
+                </div>
+                <div className="grid grid-cols-4 gap-2 pt-1">
+                  <StatChip label="requests" value={`${snap.rfq.requests}`} />
+                  <StatChip label="executed" value={`${snap.rfq.executed}`} tone="pos" />
+                  <StatChip label="refused" value={`${snap.rfq.refused}`} tone={snap.rfq.refused > 0 ? "warn" : "neutral"} sub="risk-gated" />
+                  <StatChip label="premium flow" value={fmt(snap.rfq.premiumFlow, 0)} tone={snap.rfq.premiumFlow > 0 ? "pos" : "neg"} />
+                </div>
+                <div className="rounded border border-neutral-800 bg-neutral-900/50 p-2">
+                  <div className="text-[9px] uppercase text-neutral-500 mb-1 font-mono">recent package executions</div>
+                  <div className="space-y-0.5 max-h-24 overflow-y-auto">
+                    {[...snap.rfq.executions].reverse().map((ev) => (
+                      <div key={`${ev.id}-${ev.t}`} className="flex gap-2 font-mono text-[9px]">
+                        <span className="text-neutral-600 w-10 shrink-0">{ev.t}s</span>
+                        <span className="text-neutral-400 w-28 shrink-0 truncate">{ev.label}</span>
+                        <span className={ev.side === "desk-buys" ? "text-emerald-400" : "text-rose-400"}>{ev.side === "desk-buys" ? "BUY" : "SELL"}</span>
+                        <span className="text-neutral-400">@ {fmt(ev.price)}</span>
+                        <span className="text-neutral-500">{ev.lots} lots</span>
+                        <span className="text-neutral-600">Δ {fmt(ev.delta, 0)} V {fmt(ev.vega, 0)}</span>
+                        <span className="ml-auto text-neutral-700">{ev.origin}</span>
+                      </div>
+                    ))}
+                    {!snap.rfq.executions.length && <div className="font-mono text-[9px] text-neutral-600">—</div>}
+                  </div>
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="portfolio margin — SFPM scenario scan + SOMC floor">
+              <div className="space-y-3">
+                <div>
+                  <div className="flex justify-between text-[10px] font-mono mb-1">
+                    <span className="text-neutral-500">margin utilization</span>
+                    <span className={snap.margin.utilization >= 0.9 ? "text-rose-400" : snap.margin.utilization >= 0.7 ? "text-amber-300" : "text-neutral-300"}>
+                      {vp(snap.margin.utilization, 1)}%
+                    </span>
+                  </div>
+                  <div className="relative">
+                    <SignedBar value={snap.margin.utilization} max={1.4} colorPos={snap.margin.utilization >= 0.9 ? "#fb7185" : snap.margin.utilization >= 0.7 ? "#f59e0b" : "#34d399"} colorNeg="#34d399" />
+                    <div className="absolute top-0 bottom-0 border-l border-dashed border-amber-600/60" style={{ left: `${(0.7 / 1.4) * 100}%` }} />
+                    <div className="absolute top-0 bottom-0 border-l border-dashed border-rose-600/60" style={{ left: `${(0.9 / 1.4) * 100}%` }} />
+                  </div>
+                  <div className="flex justify-between text-[8px] font-mono text-neutral-600 mt-0.5">
+                    <span>0</span><span className="text-amber-600">gated 70%</span><span className="text-rose-600">wind-down 90%</span><span>140%</span>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <StatChip label="initial margin" value={fmt(snap.margin.initial, 0)} sub="1.2× maintenance" />
+                  <StatChip label="maintenance" value={fmt(snap.margin.maintenance, 0)} sub="scan ∨ SOMC" />
+                  <StatChip label="SOMC floor" value={fmt(snap.margin.somc, 0)} tone="accent" sub="gross short wings" />
+                  <StatChip label="scan loss" value={fmt(snap.margin.scanningLoss, 0)} sub={`worst: ${snap.margin.worst}`} />
+                </div>
+                <div className="rounded border border-neutral-800 bg-neutral-900/50 p-2 space-y-1">
+                  <div className="text-[9px] uppercase text-neutral-500 font-mono mb-0.5">scenario grid losses</div>
+                  {snap.margin.perScenario.map((sc) => (
+                    <div key={sc.name}>
+                      <div className="flex justify-between text-[9px] font-mono">
+                        <span className="text-neutral-500">{sc.name}</span>
+                        <span className={sc.loss > snap.margin.scanningLoss * 0.85 ? "text-amber-300" : "text-neutral-400"}>{fmt(sc.loss, 1)}</span>
+                      </div>
+                      <div className="h-1 rounded bg-neutral-800 overflow-hidden">
+                        <div
+                          className="h-full"
+                          style={{
+                            width: `${Math.min(100, (sc.loss / Math.max(snap.margin.scanningLoss, 1)) * 100)}%`,
+                            background: sc.loss > snap.margin.scanningLoss * 0.85 ? "#f59e0b" : "#52525b",
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="funding — premium-index pin · carry-aware quotes">
+              <div className="space-y-2.5">
+                <div className="grid grid-cols-2 gap-2">
+                  <StatChip label="funding rate" value={`${vp(snap.funding.rate, 4)}%`} tone={snap.funding.rate > 0 ? "neg" : "pos"} sub="per 8h interval" />
+                  <StatChip label="premium index" value={`${vp(snap.funding.premiumIndex, 3)}%`} tone={snap.funding.premiumIndex > 0 ? "neg" : "pos"} sub="perp vs index" />
+                  <StatChip label="next payment" value={`${Math.floor(snap.funding.nextIn / 3600)}h ${Math.floor((snap.funding.nextIn % 3600) / 60)}m`} sub="longs pay when +" />
+                  <StatChip label="funding paid" value={fmt(snap.funding.paid, 1)} tone={snap.funding.paid > 0 ? "neg" : "pos"} sub="cumulative" />
+                  <StatChip label="index" value={fmt(snap.funding.index)} sub="funding anchor" />
+                  <StatChip label="perp mid" value={fmt(snap.spot)} sub={`basis ${vp(snap.funding.premiumIndex, 2)}%`} />
+                </div>
+                <div>
+                  <div className="flex justify-between text-[10px] font-mono mb-1">
+                    <span className="text-neutral-500">funding carry skew on quotes</span>
+                    <span className={signed(snap.funding.carrySkew)}>{fmt(snap.funding.carrySkew, 3)}</span>
+                  </div>
+                  <SignedBar value={snap.funding.carrySkew} max={10 * 0.5} colorPos="#38bdf8" colorNeg="#38bdf8" />
+                  <div className="text-[8px] font-mono text-neutral-600 mt-0.5">
+                    reservation price leans against the carry side — long inventory pays positive funding
+                  </div>
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="adaptive engine — learned intensity · per-side toxicity">
+              <div className="space-y-2.5">
+                <div className="grid grid-cols-2 gap-2">
+                  <StatChip label="κ assumed" value="0.50" sub="prior" />
+                  <StatChip label="κ learned" value={fmt(snap.learned.kappaUsed, 2)} tone="accent" sub={`raw ${fmt(snap.learned.kappaRaw, 2)} · ${snap.learned.fills.toFixed(0)} fills`} />
+                  <StatChip label="A assumed" value="0.12" sub="per second" />
+                  <StatChip label="A learned" value={fmt(snap.learned.aUsed, 3)} tone="accent" sub={`raw ${fmt(snap.learned.aRaw, 3)}`} />
+                </div>
+                <div className="text-[9px] font-mono text-neutral-600 leading-relaxed">
+                  online Cox MLE with shrinkage — the desk re-fits its fill model from realized
+                  (non-swept) fills and re-optimizes AS/HJB/queue distances against the estimate.
+                </div>
+                <div className="grid grid-cols-3 gap-2 pt-1 border-t border-neutral-800">
+                  <StatChip label="markout × bid" value={fmt(snap.markouts.multBid)} tone={snap.markouts.multBid > 1.3 ? "warn" : "neutral"} sub="toxic side widens" />
+                  <StatChip label="markout × ask" value={fmt(snap.markouts.multAsk)} tone={snap.markouts.multAsk > 1.3 ? "warn" : "neutral"} sub="independently" />
+                  <StatChip label="markout × net" value={fmt(snap.markouts.multiplier)} sub="aggregate" />
+                </div>
+                <div className="text-[9px] font-mono text-neutral-600 leading-relaxed">
+                  Albers et al. (2025): fill likelihood and post-fill returns trade off per side —
+                  the spread response is directional, widening only the toxic side.
+                </div>
+              </div>
+            </Panel>
+          </TabsContent>
+
           {/* ============================================ TAB: strategy */}
           <TabsContent value="strategy" className="mt-3 grid gap-3 lg:grid-cols-3">
             <Panel title="quoting strategies — 8 policies" className="lg:col-span-2">
@@ -599,14 +875,21 @@ export default function Home() {
               </div>
             </Panel>
 
-            <Panel title="risk engine">
+            <Panel title="risk engine v2 — net-delta limits · directional gating">
               <div className="space-y-3">
                 <div>
                   <div className="flex justify-between text-[10px] font-mono mb-1">
-                    <span className="text-neutral-500">perp position</span>
-                    <span className={signed(snap.position)}>{snap.position} / {snap.risk.positionLimit}</span>
+                    <span className="text-neutral-500">net delta (unhedged combined)</span>
+                    <span className={signed(snap.risk.netDelta)}>{fmt(snap.risk.netDelta, 1)} / ±{snap.risk.netDeltaLimit}</span>
                   </div>
-                  <SignedBar value={snap.position} max={snap.risk.positionLimit} />
+                  <SignedBar value={snap.risk.netDelta} max={snap.risk.netDeltaLimit} />
+                </div>
+                <div>
+                  <div className="flex justify-between text-[10px] font-mono mb-1">
+                    <span className="text-neutral-500">gross hedge leg (sanity cap)</span>
+                    <span className="text-neutral-300">{fmt(snap.risk.grossHedge, 0)} / {snap.risk.grossHedgeCap}</span>
+                  </div>
+                  <SignedBar value={snap.risk.grossHedge} max={snap.risk.grossHedgeCap} colorPos="#38bdf8" colorNeg="#38bdf8" />
                 </div>
                 <div>
                   <div className="flex justify-between text-[10px] font-mono mb-1">
@@ -622,8 +905,36 @@ export default function Home() {
                   </div>
                   <SignedBar value={snap.risk.drawdown} max={80} colorPos="#fb7185" colorNeg="#fb7185" />
                 </div>
-                <div className={`rounded border p-2 font-mono text-[10px] ${snap.risk.halted ? "border-rose-600/40 bg-rose-500/10 text-rose-300" : "border-emerald-600/30 bg-emerald-500/5 text-emerald-400"}`}>
-                  {snap.risk.halted ? `HALTED: ${snap.risk.haltReason}` : "ALL SYSTEMS NOMINAL — quoting live"}
+                <div
+                  className={`rounded border p-2 font-mono text-[10px] ${
+                    snap.risk.halted
+                      ? "border-rose-600/40 bg-rose-500/10 text-rose-300"
+                      : snap.risk.state === "breach"
+                        ? "border-orange-600/40 bg-orange-500/10 text-orange-300"
+                        : snap.risk.state === "gated"
+                          ? "border-amber-600/40 bg-amber-500/10 text-amber-300"
+                          : "border-emerald-600/30 bg-emerald-500/5 text-emerald-400"
+                  }`}
+                >
+                  {snap.risk.halted
+                    ? `HALTED: ${snap.risk.haltReason} — quotes off, hedge + marks live`
+                    : snap.risk.state === "breach"
+                      ? `BREACH (${snap.risk.gatedOn}) — unwind-only quoting at the touch; risk-adding side pulled`
+                      : snap.risk.state === "gated"
+                        ? `GATED (${snap.risk.gatedOn}) — risk-adding side pulled, unwind side tightened · self-recovers`
+                        : "ALL SYSTEMS NOMINAL — quoting live both sides"}
+                </div>
+                <div className="rounded border border-neutral-800 bg-neutral-900/50 p-2 font-mono text-[9px] space-y-0.5">
+                  <div className="text-neutral-500 uppercase text-[9px] mb-1">risk events</div>
+                  <div className="max-h-24 overflow-y-auto space-y-0.5">
+                    {[...snap.risk.events].reverse().map((ev, i) => (
+                      <div key={i} className="flex gap-2">
+                        <span className="text-neutral-600 shrink-0">{ev.t}s</span>
+                        <span className="text-neutral-400">{ev.msg}</span>
+                      </div>
+                    ))}
+                    {!snap.risk.events.length && <div className="text-neutral-600">—</div>}
+                  </div>
                 </div>
               </div>
             </Panel>
@@ -635,10 +946,11 @@ export default function Home() {
                   ["inventory drift", snap.pnl.inventory, "#a3e635"],
                   ["fees", snap.pnl.fees, "#fb7185"],
                   ["hedge cost", snap.pnl.hedgeCost, "#f43f5e"],
+                  ["funding", snap.pnl.funding, "#38bdf8"],
                   ["option premium", snap.pnl.optionPremium, "#f59e0b"],
                   ["option mark", snap.pnl.optionMark, "#fbbf24"],
                 ] as const).map(([label, v, color]) => {
-                  const max = Math.max(...[snap.pnl.spreadCapture, snap.pnl.inventory, snap.pnl.fees, snap.pnl.hedgeCost, snap.pnl.optionPremium, snap.pnl.optionMark].map(Math.abs), 1);
+                  const max = Math.max(...[snap.pnl.spreadCapture, snap.pnl.inventory, snap.pnl.fees, snap.pnl.hedgeCost, snap.pnl.funding, snap.pnl.optionPremium, snap.pnl.optionMark].map(Math.abs), 1);
                   return (
                     <div key={label}>
                       <div className="flex justify-between text-[10px] font-mono mb-1">
